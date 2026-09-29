@@ -7,6 +7,7 @@ import tempfile
 import fitz
 from flask import Flask, request, jsonify
 
+
 app = Flask(__name__)
 
 
@@ -47,22 +48,22 @@ def make_output_name(name):
 
 UNICODE_DIGIT_MAP = {}
 
-for block_start in (
-    0x0660,
-    0x06F0,
-    0x0966,
-    0x09E6,
-    0x0AE6,
-    0x0BE6,
-    0x0C66,
-    0x0CE6,
-    0x0D66,
-    0x0DE6
-):
+for block_start, ascii_start in [
+    (0x0660, 0x30),
+    (0x06F0, 0x30),
+    (0x0966, 0x30),
+    (0x09E6, 0x30),
+    (0x0AE6, 0x30),
+    (0x0BE6, 0x30),
+    (0x0C66, 0x30),
+    (0x0CE6, 0x30),
+    (0x0D66, 0x30),
+    (0x0DE6, 0x30),
+]:
     for i in range(10):
         UNICODE_DIGIT_MAP[
             chr(block_start + i)
-        ] = chr(0x30 + i)
+        ] = chr(ascii_start + i)
 
 
 def normalize_digit(ch):
@@ -146,11 +147,13 @@ def page_characters(page):
                     if not bbox or not origin:
                         continue
 
+                    digit = normalize_digit(
+                        char
+                    )
+
                     output.append({
                         "char": char,
-                        "digit": normalize_digit(
-                            char
-                        ),
+                        "digit": digit,
                         "bbox": tuple(bbox),
                         "origin": tuple(origin),
                         "font": font,
@@ -158,8 +161,9 @@ def page_characters(page):
                         "color": color,
                         "flags": flags,
 
-                        # IMPORTANT:
-                        # Keep PDF block/line information.
+                        # Needed only so a phone number
+                        # can continue across a PDF
+                        # text-line break.
                         "block_index": block_index,
                         "line_index": line_index
                     })
@@ -174,17 +178,17 @@ def page_characters(page):
 def candidate_digits(candidate):
 
     return "".join(
-        item["digit"]
-        for item in candidate
-        if item["digit"]
+        x["digit"]
+        for x in candidate
+        if x["digit"]
     )
 
 
 def candidate_text(candidate):
 
     return "".join(
-        item["char"]
-        for item in candidate
+        x["char"]
+        for x in candidate
     )
 
 
@@ -194,13 +198,49 @@ def candidate_text(candidate):
 
 def detect_numbers(page):
 
+    """
+    Detect phone numbers from their DIGITS.
+
+    Non-digit/non-letter characters are treated as
+    formatting automatically.
+
+    No list of separators is used.
+
+    Therefore all of these can work:
+
+        +52 — 800 — 461—1544
+        +52 – 800 • 461 ✦ 1544
+        +52 | 800 | 461 | 1544
+        +52 (800) 461/1544
+        +52)800#461@1544
+
+    A phone number can also continue onto the
+    immediately following PDF text line when the
+    line break is clearly part of the formatting.
+
+    Example:
+
+        +52 — 800 —
+        461—1544
+
+    becomes:
+
+        528004611544
+
+    And:
+
+        +1 | 888 | 393
+        | 2619
+
+    becomes:
+
+        18883932619
+    """
+
     chars = page_characters(page)
 
     # ---------------------------------------------
-    # Group characters by their ORIGINAL PDF block.
-    #
-    # This is important because a phone number can
-    # continue onto the next visual text line.
+    # Group characters by original PDF text block.
     # ---------------------------------------------
 
     blocks = {}
@@ -218,100 +258,276 @@ def detect_numbers(page):
 
     for block_chars in blocks.values():
 
-        # Keep PDF reading order:
-        # line first, then horizontal position.
-        block_chars.sort(
-            key=lambda x: (
-                x["line_index"],
-                x["bbox"][0]
-            )
-        )
+        # -----------------------------------------
+        # Group by original PDF line.
+        # -----------------------------------------
 
-        current = []
+        lines = {}
 
         for item in block_chars:
 
-            # -------------------------------------
-            # DIGIT
-            # -------------------------------------
+            line_id = item["line_index"]
 
-            if item["digit"]:
+            lines.setdefault(
+                line_id,
+                []
+            ).append(item)
 
-                current.append(item)
+        ordered_lines = []
 
-                continue
+        for line_id, line_chars in lines.items():
 
-            # -------------------------------------
-            # NON-DIGIT
-            # -------------------------------------
-            #
-            # IMPORTANT:
-            #
-            # We do NOT maintain a list such as:
-            #
-            # "+-()[]{}./#@*_:"
-            #
-            # ANY non-alphanumeric character is
-            # treated as formatting.
-            #
-            # Examples:
-            #
-            # -
-            # —
-            # –
-            # /
-            # (
-            # )
-            # [
-            # ]
-            # #
-            # @
-            # •
-            # ✦
-            # Unicode spaces
-            # etc.
-            #
-            # They do NOT break the number.
-            # -------------------------------------
+            line_chars.sort(
+                key=lambda x:
+                    x["bbox"][0]
+            )
 
-            if not item["char"].isalnum():
+            ordered_lines.append(
+                (
+                    line_id,
+                    line_chars
+                )
+            )
 
-                continue
+        ordered_lines.sort(
+            key=lambda x: (
+                min(
+                    c["bbox"][1]
+                    for c in x[1]
+                ),
+                x[0]
+            )
+        )
 
-            # -------------------------------------
-            # A real letter/alphanumeric character
-            # ends the current number.
-            # -------------------------------------
+        # -----------------------------------------
+        # Create digit fragments on each line.
+        # -----------------------------------------
 
+        fragments = []
+
+        for line_position, (
+            line_id,
+            line_chars
+        ) in enumerate(
+            ordered_lines
+        ):
+
+            current = []
+
+            for item in line_chars:
+
+                # Digit
+                if item["digit"]:
+
+                    current.append(
+                        item
+                    )
+
+                    continue
+
+                # ANY non-alphanumeric character
+                # is formatting.
+                #
+                # No hard-coded separator list.
+                #
+                # This automatically handles:
+                # -  —  –  |  /  \
+                # -  ( ) [ ] { }
+                # -  # @ * _
+                # -  • ✦ ~
+                # - Unicode spaces
+                # - other special characters
+
+                if not item["char"].isalnum():
+
+                    continue
+
+                # A real letter/alphanumeric
+                # character ends the number.
+                if current:
+
+                    digits = candidate_digits(
+                        current
+                    )
+
+                    if 1 <= len(digits) <= 15:
+
+                        fragments.append({
+                            "items": current[:],
+                            "line_position":
+                                line_position,
+                            "line_id":
+                                line_id
+                        })
+
+                    current = []
+
+            # End of line
             if current:
 
                 digits = candidate_digits(
                     current
                 )
 
-                if 8 <= len(digits) <= 15:
+                if 1 <= len(digits) <= 15:
 
-                    results.append(
-                        current[:]
-                    )
-
-                current = []
+                    fragments.append({
+                        "items": current[:],
+                        "line_position":
+                            line_position,
+                        "line_id":
+                            line_id
+                    })
 
         # -----------------------------------------
-        # End of PDF text block
+        # Merge genuine wrapped phone numbers.
         # -----------------------------------------
 
-        if current:
+        i = 0
 
-            digits = candidate_digits(
+        while i < len(fragments):
+
+            current = fragments[i][
+                "items"
+            ][:]
+
+            current_digits = candidate_digits(
                 current
             )
 
-            if 8 <= len(digits) <= 15:
+            last_fragment = fragments[i]
+
+            j = i + 1
+
+            while j < len(fragments):
+
+                nxt = fragments[j]
+
+                # Must be the immediately
+                # following PDF text line.
+                if nxt["line_position"] != (
+                    last_fragment[
+                        "line_position"
+                    ] + 1
+                ):
+
+                    break
+
+                next_items = nxt[
+                    "items"
+                ]
+
+                next_digits = candidate_digits(
+                    next_items
+                )
+
+                if not next_digits:
+                    break
+
+                # Never make a candidate longer
+                # than the supported phone range.
+                if (
+                    len(current_digits)
+                    + len(next_digits)
+                    > 15
+                ):
+
+                    break
+
+                previous_line = (
+                    ordered_lines[
+                        last_fragment[
+                            "line_position"
+                        ]
+                    ][1]
+                )
+
+                next_line = (
+                    ordered_lines[
+                        nxt[
+                            "line_position"
+                        ]
+                    ][1]
+                )
+
+                if not previous_line:
+                    break
+
+                if not next_line:
+                    break
+
+                previous_last = (
+                    previous_line[-1]
+                )
+
+                next_first = (
+                    next_line[0]
+                )
+
+                # Example:
+                #
+                # +52 — 800 —
+                # 461—1544
+                #
+                # Previous line ends with
+                # formatting.
+                previous_has_formatting = (
+                    not previous_last["digit"]
+                    and not previous_last[
+                        "char"
+                    ].isalnum()
+                )
+
+                # Example:
+                #
+                # +1 | 888 | 393
+                # | 2619
+                #
+                # Next line starts with
+                # formatting.
+                next_has_formatting = (
+                    not next_first["digit"]
+                    and not next_first[
+                        "char"
+                    ].isalnum()
+                )
+
+                # Only merge when the line break
+                # is clearly part of formatting.
+                if not (
+                    previous_has_formatting
+                    or next_has_formatting
+                ):
+
+                    break
+
+                current.extend(
+                    next_items
+                )
+
+                current_digits = (
+                    candidate_digits(
+                        current
+                    )
+                )
+
+                last_fragment = nxt
+
+                j += 1
+
+            # Only actual phone-length candidates.
+            if 8 <= len(
+                current_digits
+            ) <= 15:
 
                 results.append(
-                    current[:]
+                    current
                 )
+
+            i = max(
+                i + 1,
+                j
+            )
 
     return results
 
@@ -377,7 +593,9 @@ def analyze():
             len(doc)
         ):
 
-            page = doc[page_index]
+            page = doc[
+                page_index
+            ]
 
             candidates = detect_numbers(
                 page
@@ -402,21 +620,28 @@ def analyze():
 
                     found[digits] = {
                         "number": digits,
-                        "country": detect_country(
-                            digits
-                        ),
+                        "country":
+                            detect_country(
+                                digits
+                            ),
                         "count": 0,
                         "variants": []
                     }
 
-                found[digits]["count"] += 1
+                found[digits][
+                    "count"
+                ] += 1
 
                 if (
                     raw
-                    not in found[digits]["variants"]
+                    not in found[digits][
+                        "variants"
+                    ]
                 ):
 
-                    found[digits]["variants"].append(
+                    found[digits][
+                        "variants"
+                    ].append(
                         raw
                     )
 
@@ -427,7 +652,8 @@ def analyze():
         )
 
         numbers.sort(
-            key=lambda x: x["count"],
+            key=lambda x:
+                x["count"],
             reverse=True
         )
 
@@ -460,6 +686,7 @@ def get_font_file(
     for font in fonts:
 
         xref = font[0]
+
         basefont = font[3]
 
         if (
@@ -511,7 +738,6 @@ def get_font_file(
                         return temp.name
 
             except Exception:
-
                 pass
 
     return None
@@ -528,7 +754,9 @@ def replace_character_digit(
     font_file=None
 ):
 
-    x0, y0, x1, y1 = char["bbox"]
+    x0, y0, x1, y1 = (
+        char["bbox"]
+    )
 
     origin_x, origin_y = (
         char["origin"]
@@ -541,6 +769,8 @@ def replace_character_digit(
         y1
     )
 
+    # Remove ONLY this original
+    # digit glyph.
     page.add_redact_annot(
         rect,
         fill=False,
@@ -553,6 +783,7 @@ def replace_character_digit(
             origin_y
         ),
 
+        # Keep original font size.
         "size": char["size"],
 
         "color": char["color"],
@@ -572,11 +803,19 @@ def insert_replacement(
     item
 ):
 
-    origin = item["origin"]
+    origin = item[
+        "origin"
+    ]
 
-    size = item["size"]
+    # Keep original extracted
+    # font size.
+    size = item[
+        "size"
+    ]
 
-    color_int = item["color"]
+    color_int = item[
+        "color"
+    ]
 
     r = (
         (color_int >> 16)
@@ -610,16 +849,17 @@ def insert_replacement(
     }
 
     # Keep the existing font strategy.
-    # We are NOT changing this part unnecessarily.
     if font_file:
 
-        kwargs["fontfile"] = (
-            font_file
-        )
+        kwargs[
+            "fontfile"
+        ] = font_file
 
     else:
 
-        kwargs["fontname"] = "helv"
+        kwargs[
+            "fontname"
+        ] = "helv"
 
     page.insert_text(
         origin,
@@ -647,11 +887,9 @@ def replace():
             body.get("data")
         )
 
-        replacements = (
-            body.get(
-                "replacements",
-                []
-            )
+        replacements = body.get(
+            "replacements",
+            []
         )
 
         replacement_map = {}
@@ -687,7 +925,9 @@ def replace():
             len(doc)
         ):
 
-            page = doc[page_index]
+            page = doc[
+                page_index
+            ]
 
             candidates = detect_numbers(
                 page
@@ -715,9 +955,8 @@ def replace():
                     ]
                 )
 
-                # Same digit count is required
-                # so original character positions
-                # remain unchanged.
+                # Keep the original number's
+                # digit count.
                 if (
                     len(new_digits)
                     != len(old_digits)
@@ -776,8 +1015,8 @@ def replace():
 
             if pending:
 
-                # Remove ONLY the original
-                # digit glyphs.
+                # Remove ONLY the selected
+                # original digit glyphs.
                 page.apply_redactions(
                     images=0,
                     graphics=0,
@@ -785,7 +1024,8 @@ def replace():
                 )
 
                 # Put replacement digits back
-                # at their original coordinates.
+                # at their original coordinates
+                # and original font size.
                 for item in pending:
 
                     insert_replacement(
@@ -846,7 +1086,6 @@ def replace():
                 )
 
             except Exception:
-
                 pass
 
 
