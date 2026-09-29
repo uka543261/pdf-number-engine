@@ -79,8 +79,8 @@ def normalize_digit(ch):
 # =================================================
 
 def page_characters(page):
-    data = page.get_text("rawdict")
 
+    data = page.get_text("rawdict")
     output = []
 
     for block in data.get("blocks", []):
@@ -128,6 +128,7 @@ def page_characters(page):
 # =================================================
 
 def candidate_digits(candidate):
+
     return "".join(
         item["digit"]
         for item in candidate
@@ -136,6 +137,7 @@ def candidate_digits(candidate):
 
 
 def candidate_text(candidate):
+
     return "".join(
         item["char"]
         for item in candidate
@@ -167,7 +169,7 @@ def detect_numbers(page):
     results = []
 
     allowed_separators = set(
-        "+-()[]{}./#@*_:" 
+        "+-()[]{}./#@*_:"
     )
 
     for line_chars in lines.values():
@@ -182,22 +184,17 @@ def detect_numbers(page):
 
             ch = item["char"]
 
-            # Digit
             if item["digit"]:
 
                 current.append(item)
                 continue
 
-            # Allowed formatting character.
-            # It does NOT become part of the digit sequence.
             if (
                 ch.isspace()
                 or ch in allowed_separators
             ):
                 continue
 
-            # Another character means the current
-            # number has ended.
             if current:
 
                 digits = candidate_digits(
@@ -205,13 +202,13 @@ def detect_numbers(page):
                 )
 
                 if 8 <= len(digits) <= 15:
+
                     results.append(
                         current[:]
                     )
 
                 current = []
 
-        # End of line
         if current:
 
             digits = candidate_digits(
@@ -219,6 +216,7 @@ def detect_numbers(page):
             )
 
             if 8 <= len(digits) <= 15:
+
                 results.append(
                     current[:]
                 )
@@ -232,7 +230,7 @@ def detect_numbers(page):
 
 def detect_country(number):
 
-    prefixes = {
+    countries = {
         "52": "Mexico",
         "57": "Colombia",
         "54": "Argentina",
@@ -243,7 +241,7 @@ def detect_country(number):
         "1": "USA / Canada"
     }
 
-    for prefix, country in prefixes.items():
+    for prefix, country in countries.items():
 
         if number.startswith(prefix):
             return country
@@ -275,11 +273,7 @@ def analyze():
 
         found = {}
 
-        for page_index in range(
-            len(doc)
-        ):
-
-            page = doc[page_index]
+        for page in doc:
 
             candidates = detect_numbers(
                 page
@@ -346,11 +340,10 @@ def analyze():
 
 
 # =================================================
-# FONT HANDLING
+# GET ORIGINAL PDF FONT REFERENCE
 # =================================================
 
-def get_font_buffer(
-    doc,
+def get_page_font_ref(
     page,
     font_name
 ):
@@ -358,39 +351,38 @@ def get_font_buffer(
     if not font_name:
         return None
 
-    for font in page.get_fonts(
-        full=True
-    ):
+    try:
 
-        xref = font[0]
-        basefont = font[3] or ""
+        fonts = page.get_fonts(
+            full=True
+        )
 
-        if (
-            basefont == font_name
-            or font_name in basefont
-            or basefont in font_name
-        ):
+        for font in fonts:
 
-            try:
+            basefont = font[3] or ""
+            ref = font[4] or ""
 
-                info = doc.extract_font(
-                    xref
-                )
+            if (
+                basefont == font_name
+                or font_name in basefont
+                or basefont in font_name
+            ):
 
-                if (
-                    info
-                    and len(info) >= 4
-                    and info[3]
-                ):
+                if ref:
+                    # PyMuPDF allows reusing an existing
+                    # page font by its resource reference.
+                    return "/" + ref
 
-                    return info[3]
+    except Exception:
 
-            except Exception:
-
-                return None
+        pass
 
     return None
 
+
+# =================================================
+# COLOR
+# =================================================
 
 def color_tuple(color_int):
 
@@ -417,55 +409,15 @@ def color_tuple(color_int):
     )
 
 
-def prepare_font(
-    page,
-    font_buffer,
-    font_key
-):
-
-    # If original font cannot be extracted,
-    # use Helvetica safely.
-    if not font_buffer:
-        return "helv"
-
-    safe_key = (
-        "F"
-        + re.sub(
-            r"[^A-Za-z0-9_]",
-            "_",
-            font_key or "Original"
-        )
-    )
-
-    if not safe_key:
-        safe_key = "FOriginal"
-
-    try:
-
-        page.insert_font(
-            fontname=safe_key,
-            fontbuffer=font_buffer
-        )
-
-        return safe_key
-
-    except Exception:
-
-        # Important:
-        # Never let a bad embedded font crash
-        # the complete PDF replacement.
-        return "helv"
-
-
 # =================================================
-# CHARACTER REPLACEMENT
+# PREPARE CHARACTER REPLACEMENT
 # =================================================
 
 def replace_character_digit(
     page,
     char,
     new_digit,
-    font_name
+    font_ref
 ):
 
     x0, y0, x1, y1 = char["bbox"]
@@ -487,25 +439,45 @@ def replace_character_digit(
         "origin": char["origin"],
         "size": char["size"],
         "color": char["color"],
-        "font_name": font_name,
+        "font_ref": font_ref,
         "digit": new_digit
     }
 
+
+# =================================================
+# INSERT REPLACEMENT CHARACTER
+# =================================================
 
 def insert_replacement(
     page,
     item
 ):
 
+    kwargs = {
+        "fontsize": item["size"],
+        "color": color_tuple(
+            item["color"]
+        ),
+        "overlay": True
+    }
+
+    if item.get("font_ref"):
+
+        # Reuse the ORIGINAL font already
+        # present on the PDF page.
+        kwargs["fontname"] = (
+            item["font_ref"]
+        )
+
+    else:
+
+        # Safe fallback.
+        kwargs["fontname"] = "helv"
+
     page.insert_text(
         item["origin"],
         item["digit"],
-        fontsize=item["size"],
-        fontname=item["font_name"],
-        color=color_tuple(
-            item["color"]
-        ),
-        overlay=True
+        **kwargs
     )
 
 
@@ -546,6 +518,7 @@ def replace():
             )
 
             if old_value is None:
+
                 old_value = item.get(
                     "old"
                 )
@@ -555,6 +528,7 @@ def replace():
             )
 
             if new_value is None:
+
                 new_value = item.get(
                     "new"
                 )
@@ -567,8 +541,9 @@ def replace():
                 new_value
             )
 
-            # Same number of digits is required.
-            # This preserves the original character positions.
+            # Same number of digits means
+            # the original character positions
+            # can be preserved.
             if (
                 old
                 and new
@@ -593,11 +568,7 @@ def replace():
 
         changed = 0
 
-        for page_index in range(
-            len(doc)
-        ):
-
-            page = doc[page_index]
+        for page in doc:
 
             candidates = detect_numbers(
                 page
@@ -611,8 +582,10 @@ def replace():
                     candidate
                 )
 
-                new_digits = replacement_map.get(
-                    old_digits
+                new_digits = (
+                    replacement_map.get(
+                        old_digits
+                    )
                 )
 
                 if not new_digits:
@@ -631,18 +604,11 @@ def replace():
                     ):
                         break
 
-                    # Try to preserve the original
-                    # embedded font.
-                    font_buffer = get_font_buffer(
-                        doc,
-                        page,
-                        char["font"]
-                    )
-
-                    font_name = prepare_font(
-                        page,
-                        font_buffer,
-                        char["font"]
+                    font_ref = (
+                        get_page_font_ref(
+                            page,
+                            char["font"]
+                        )
                     )
 
                     pending.append(
@@ -652,7 +618,7 @@ def replace():
                             new_digits[
                                 digit_index
                             ],
-                            font_name
+                            font_ref
                         )
                     )
 
@@ -669,8 +635,8 @@ def replace():
                     text=0
                 )
 
-                # Put new digit at the exact
-                # original character position.
+                # Put each new digit back
+                # at its original position.
                 for item in pending:
 
                     insert_replacement(
@@ -689,10 +655,8 @@ def replace():
 
         doc.close()
 
-        output.seek(0)
-
         encoded = base64.b64encode(
-            output.read()
+            output.getvalue()
         ).decode("ascii")
 
         return jsonify({
@@ -722,7 +686,7 @@ def replace():
 
 
 # =================================================
-# HEALTH CHECK
+# HEALTH
 # =================================================
 
 @app.get("/")
@@ -735,7 +699,7 @@ def home():
 
 
 # =================================================
-# LOCAL RUN
+# RUN
 # =================================================
 
 if __name__ == "__main__":
