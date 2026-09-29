@@ -1,797 +1,364 @@
-from flask import Flask, request, jsonify
-import fitz
 import base64
 import io
 import os
 import re
 import tempfile
 
+import fitz
+from flask import Flask, request, jsonify
+
 app = Flask(__name__)
 
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
-PHONE_REGEX = re.compile(
-    r"(?:\+?\d(?:[^A-Za-z0-9\r\n]{0,8}\d){7,14})"
-)
+# =================================================
+# BASIC HELPERS
+# =================================================
 
-SEPARATORS = set(" +-()./#@_|\\*[]{}:'\",;")
-
-FONT_CACHE = {}
+def digits_only(value):
+    return re.sub(r"\D", "", str(value or ""))
 
 
-def normalize_digits(value):
-    return re.sub(r"\D", "", value or "")
+def clean_base64(value):
+    value = str(value or "")
+
+    if "," in value:
+        value = value.split(",", 1)[1]
+
+    return base64.b64decode(value)
 
 
-def country_from_digits(digits):
-    countries = {
-        "52": "Mexico",
-        "1": "United States / Canada",
-        "44": "United Kingdom",
-        "91": "India",
-        "971": "United Arab Emirates",
-        "92": "Pakistan",
-        "61": "Australia",
-        "49": "Germany",
-        "33": "France",
-        "39": "Italy",
-        "81": "Japan",
-        "86": "China",
-    }
+def make_output_name(name):
+    name = str(name or "output.pdf")
 
-    for prefix, country in countries.items():
-        if digits.startswith(prefix):
-            return country
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
 
-    return "Unknown"
-
-
-# =========================================================
-# ANALYZE
-# =========================================================
-
-def analyze_pdf(pdf_bytes):
-
-    doc = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    )
-
-    found = {}
-
-    try:
-
-        for page in doc:
-
-            text = page.get_text(
-                "text",
-                sort=True
-            )
-
-            for match in PHONE_REGEX.finditer(text):
-
-                raw = match.group(0)
-
-                digits = normalize_digits(raw)
-
-                if not 8 <= len(digits) <= 15:
-                    continue
-
-                if digits not in found:
-
-                    found[digits] = {
-                        "digits": digits,
-                        "country": country_from_digits(digits),
-                        "count": 0,
-                        "formats": []
-                    }
-
-                found[digits]["count"] += 1
-
-                if raw not in found[digits]["formats"]:
-                    found[digits]["formats"].append(raw)
-
-        return {
-            "numbers": list(found.values()),
-            "totalPages": len(doc)
-        }
-
-    finally:
-        doc.close()
-
-
-# =========================================================
-# FAST PAGE FILTER
-# =========================================================
-
-def page_has_target(page, targets):
-
-    text = page.get_text(
-        "text",
-        sort=True
-    )
-
-    digits = normalize_digits(text)
-
-    return any(
-        target in digits
-        for target in targets
+    return re.sub(
+        r"\.pdf$",
+        "_replaced.pdf",
+        name,
+        flags=re.I
     )
 
 
-# =========================================================
-# FONT CACHE
-# =========================================================
+# =================================================
+# UNICODE DIGITS
+# =================================================
 
-def get_font_file(doc, page, font_name):
+UNICODE_DIGIT_MAP = {}
 
-    if not font_name:
-        return None
+for block_start in (
+    0x0660,
+    0x06F0,
+    0x0966,
+    0x09E6,
+    0x0AE6,
+    0x0BE6,
+    0x0C66,
+    0x0CE6,
+    0x0D66,
+    0x0DE6
+):
+    for i in range(10):
+        UNICODE_DIGIT_MAP[
+            chr(block_start + i)
+        ] = chr(0x30 + i)
 
-    if font_name in FONT_CACHE:
-        return FONT_CACHE[font_name]
 
-    try:
+def normalize_digit(ch):
 
-        for font in page.get_fonts(full=True):
+    if ch in UNICODE_DIGIT_MAP:
+        return UNICODE_DIGIT_MAP[ch]
 
-            xref = font[0]
-            basefont = font[3] or ""
-            short_name = font[4] or ""
-
-            if not (
-                font_name == basefont
-                or font_name == short_name
-                or font_name in basefont
-                or font_name in short_name
-            ):
-                continue
-
-            extracted = doc.extract_font(xref)
-
-            if not extracted:
-                continue
-
-            name = extracted[0] or "font"
-            ext = extracted[1] or "ttf"
-            content = extracted[3]
-
-            if not content:
-                continue
-
-            safe = re.sub(
-                r"[^A-Za-z0-9_-]",
-                "_",
-                name
-            )
-
-            path = os.path.join(
-                tempfile.gettempdir(),
-                "pdf_font_" +
-                str(xref) +
-                "_" +
-                safe +
-                "." +
-                ext
-            )
-
-            if not os.path.exists(path):
-
-                with open(path, "wb") as f:
-                    f.write(content)
-
-            FONT_CACHE[font_name] = path
-
-            return path
-
-    except Exception:
-        pass
-
-    FONT_CACHE[font_name] = None
+    if "0" <= ch <= "9":
+        return ch
 
     return None
 
 
-def color_from_int(value):
+# =================================================
+# CHARACTER EXTRACTION
+# =================================================
 
-    try:
+def page_characters(page):
 
-        value = int(value or 0)
+    data = page.get_text("rawdict")
 
-        return (
-            ((value >> 16) & 255) / 255,
-            ((value >> 8) & 255) / 255,
-            (value & 255) / 255
-        )
+    output = []
 
-    except Exception:
-
-        return (0, 0, 0)
-
-
-# =========================================================
-# FIND COMPLETE PHONE OCCURRENCES
-#
-# Example:
-#
-# +52-800-461-1544
-#
-# Old digits:
-# 528004611544
-#
-# New digits:
-# 528004611460
-#
-# Result:
-# +52-800-461-1460
-#
-# The ORIGINAL separators are copied from the PDF.
-# =========================================================
-
-def find_occurrences(page, targets):
-
-    raw = page.get_text(
-        "rawdict",
-        sort=True
-    )
-
-    results = []
-
-    for block in raw.get("blocks", []):
+    for block in data.get("blocks", []):
 
         if block.get("type") != 0:
             continue
 
         for line in block.get("lines", []):
 
-            chars = []
-
             for span in line.get("spans", []):
 
-                font = span.get("font")
+                font = span.get("font", "")
                 size = span.get("size", 10)
                 color = span.get("color", 0)
+                flags = span.get("flags", 0)
 
                 for ch in span.get("chars", []):
 
-                    value = ch.get("c", "")
+                    char = ch.get("c", "")
 
-                    chars.append({
-                        "c": value,
-                        "bbox": ch.get("bbox"),
-                        "origin": ch.get("origin"),
+                    if not char:
+                        continue
+
+                    bbox = ch.get("bbox")
+                    origin = ch.get("origin")
+
+                    if not bbox or not origin:
+                        continue
+
+                    digit = normalize_digit(char)
+
+                    output.append({
+                        "char": char,
+                        "digit": digit,
+                        "bbox": tuple(bbox),
+                        "origin": tuple(origin),
                         "font": font,
                         "size": size,
-                        "color": color
+                        "color": color,
+                        "flags": flags
                     })
 
-            if not chars:
+    return output
+
+
+# =================================================
+# NUMBER HELPERS
+# =================================================
+
+def candidate_digits(candidate):
+
+    return "".join(
+        x["digit"]
+        for x in candidate
+        if x["digit"]
+    )
+
+
+def candidate_text(candidate):
+
+    return "".join(
+        x["char"]
+        for x in candidate
+    )
+
+
+def detect_numbers(page):
+
+    chars = page_characters(page)
+
+    lines = {}
+
+    for item in chars:
+
+        y = round(
+            item["bbox"][1],
+            1
+        )
+
+        key = int(
+            round(y / 2.0)
+        )
+
+        lines.setdefault(
+            key,
+            []
+        ).append(item)
+
+    results = []
+
+    for line_chars in lines.values():
+
+        line_chars.sort(
+            key=lambda x: x["bbox"][0]
+        )
+
+        current = []
+
+        for item in line_chars:
+
+            ch = item["char"]
+
+            if item["digit"]:
+
+                current.append(item)
                 continue
 
-            # -------------------------------------------------
-            # Build normalized digit stream.
-            # -------------------------------------------------
+            if (
+                ch.isspace()
+                or ch in "+-()[]{}./#@*_:\u00a0"
+            ):
 
-            digit_positions = []
-            digit_string = ""
-
-            for i, item in enumerate(chars):
-
-                c = item["c"]
-
-                if c.isdigit():
-
-                    digit_positions.append(i)
-                    digit_string += c
-
-                elif c in SEPARATORS or c.isspace():
-
-                    continue
-
-                else:
-
-                    # Do not join across unrelated text.
-                    digit_positions = []
-                    digit_string = ""
-
-            if not digit_string:
                 continue
 
-            # -------------------------------------------------
-            # Find target.
-            # -------------------------------------------------
+            if current:
 
-            for target in targets:
+                digits = candidate_digits(
+                    current
+                )
 
-                start = 0
+                if 8 <= len(digits) <= 15:
 
-                while True:
-
-                    pos = digit_string.find(
-                        target,
-                        start
+                    results.append(
+                        current[:]
                     )
 
-                    if pos == -1:
-                        break
+                current = []
 
-                    end = pos + len(target)
+        if current:
 
-                    selected_positions = digit_positions[
-                        pos:end
-                    ]
+            digits = candidate_digits(
+                current
+            )
 
-                    if len(selected_positions) != len(target):
+            if 8 <= len(digits) <= 15:
 
-                        start = pos + 1
-                        continue
-
-                    first_pos = selected_positions[0]
-                    last_pos = selected_positions[-1]
-
-                    # Complete original visual substring.
-                    selected_chars = chars[
-                        first_pos:last_pos + 1
-                    ]
-
-                    # Make sure nothing unrelated is inside.
-                    valid = True
-
-                    for item in selected_chars:
-
-                        c = item["c"]
-
-                        if (
-                            not c.isdigit()
-                            and not c.isspace()
-                            and c not in SEPARATORS
-                        ):
-                            valid = False
-                            break
-
-                    if not valid:
-
-                        start = pos + 1
-                        continue
-
-                    # Original formatted string.
-                    original_text = "".join(
-                        item["c"]
-                        for item in selected_chars
-                    )
-
-                    first = selected_chars[0]
-
-                    last = selected_chars[-1]
-
-                    # Bounding box of the COMPLETE occurrence.
-                    valid_boxes = [
-                        item["bbox"]
-                        for item in selected_chars
-                        if item.get("bbox")
-                    ]
-
-                    if not valid_boxes:
-
-                        start = pos + 1
-                        continue
-
-                    x0 = min(
-                        box[0]
-                        for box in valid_boxes
-                    )
-
-                    y0 = min(
-                        box[1]
-                        for box in valid_boxes
-                    )
-
-                    x1 = max(
-                        box[2]
-                        for box in valid_boxes
-                    )
-
-                    y1 = max(
-                        box[3]
-                        for box in valid_boxes
-                    )
-
-                    results.append({
-                        "old": target,
-                        "original_text": original_text,
-                        "rect": fitz.Rect(
-                            x0,
-                            y0,
-                            x1,
-                            y1
-                        ),
-                        "origin": first["origin"],
-                        "font": first["font"],
-                        "size": first["size"],
-                        "color": first["color"]
-                    })
-
-                    start = pos + len(target)
+                results.append(
+                    current[:]
+                )
 
     return results
 
 
-# =========================================================
-# REPLACE
-# =========================================================
+# =================================================
+# COUNTRY
+# =================================================
 
-def replace_pdf(doc, replacement_map):
+def detect_country(number):
 
-    targets = list(
-        replacement_map.keys()
-    )
+    if number.startswith("52"):
+        return "Mexico"
 
-    pages_processed = 0
-    occurrences_replaced = 0
+    if number.startswith("57"):
+        return "Colombia"
 
-    for page_number in range(len(doc)):
+    if number.startswith("54"):
+        return "Argentina"
 
-        page = doc[page_number]
+    if number.startswith("34"):
+        return "Spain"
 
-        # Very fast page filter.
-        if not page_has_target(
-            page,
-            targets
-        ):
-            continue
+    if number.startswith("56"):
+        return "Chile"
 
-        occurrences = find_occurrences(
-            page,
-            targets
-        )
+    if number.startswith("51"):
+        return "Peru"
 
-        if not occurrences:
-            continue
+    if number.startswith("44"):
+        return "UK"
 
-        page_actions = []
+    if number.startswith("1"):
+        return "USA / Canada"
 
-        # -------------------------------------------------
-        # Prepare each occurrence.
-        # -------------------------------------------------
-
-        for occurrence in occurrences:
-
-            old = occurrence["old"]
-
-            new_digits = replacement_map.get(old)
-
-            if not new_digits:
-                continue
-
-            if len(old) != len(new_digits):
-                continue
-
-            original_text = occurrence[
-                "original_text"
-            ]
-
-            # -------------------------------------------------
-            # Preserve EVERY original non-digit character.
-            #
-            # Example:
-            #
-            # +52-800-461-1544
-            #
-            # becomes:
-            #
-            # +52-800-461-1460
-            # -------------------------------------------------
-
-            digit_index = 0
-            new_text_parts = []
-
-            for c in original_text:
-
-                if c.isdigit():
-
-                    if digit_index >= len(new_digits):
-                        break
-
-                    new_text_parts.append(
-                        new_digits[digit_index]
-                    )
-
-                    digit_index += 1
-
-                else:
-
-                    new_text_parts.append(c)
-
-            if digit_index != len(new_digits):
-                continue
-
-            new_text = "".join(
-                new_text_parts
-            )
-
-            page_actions.append({
-                "rect": occurrence["rect"],
-                "text": new_text,
-                "origin": occurrence["origin"],
-                "font": occurrence["font"],
-                "size": occurrence["size"],
-                "color": occurrence["color"]
-            })
-
-        if not page_actions:
-            continue
-
-        pages_processed += 1
-
-        # -------------------------------------------------
-        # ONE REDACTION PER COMPLETE PHONE NUMBER.
-        # -------------------------------------------------
-
-        for action in page_actions:
-
-            page.add_redact_annot(
-                action["rect"],
-                fill=False,
-                cross_out=False
-            )
-
-        # ONE redaction pass for entire page.
-        page.apply_redactions(
-            images=0,
-            graphics=0,
-            text=0
-        )
-
-        # -------------------------------------------------
-        # ONE INSERTION PER PHONE NUMBER.
-        # -------------------------------------------------
-
-        for action in page_actions:
-
-            font_file = get_font_file(
-                doc,
-                page,
-                action["font"]
-            )
-
-            inserted = False
-
-            if font_file:
-
-                try:
-
-                    page.insert_text(
-                        action["origin"],
-                        action["text"],
-                        fontfile=font_file,
-                        fontsize=action["size"],
-                        color=color_from_int(
-                            action["color"]
-                        ),
-                        overlay=True
-                    )
-
-                    inserted = True
-
-                except Exception:
-                    pass
-
-            if not inserted:
-
-                try:
-
-                    page.insert_text(
-                        action["origin"],
-                        action["text"],
-                        fontname="helv",
-                        fontsize=action["size"],
-                        color=color_from_int(
-                            action["color"]
-                        ),
-                        overlay=True
-                    )
-
-                except Exception:
-                    pass
-
-            occurrences_replaced += 1
-
-    return (
-        pages_processed,
-        occurrences_replaced
-    )
+    return "Unknown"
 
 
-# =========================================================
-# HOME
-# =========================================================
-
-@app.route("/", methods=["GET"])
-def home():
-
-    return jsonify({
-        "status": "PDF Number Engine running"
-    })
-
-
-# =========================================================
+# =================================================
 # ANALYZE
-# =========================================================
+# =================================================
 
-@app.route("/analyze", methods=["POST"])
+@app.post("/analyze")
 def analyze():
 
     try:
 
-        data = request.get_json(
+        body = request.get_json(
             force=True
         )
 
-        if not data or not data.get("data"):
-
-            return jsonify({
-                "error": "PDF data missing."
-            }), 400
-
-        pdf_bytes = base64.b64decode(
-            data["data"]
+        pdf_bytes = clean_base64(
+            body.get("data")
         )
-
-        if len(pdf_bytes) > MAX_UPLOAD_BYTES:
-
-            return jsonify({
-                "error": "PDF too large. Maximum 25 MB."
-            }), 400
-
-        return jsonify(
-            analyze_pdf(pdf_bytes)
-        )
-
-    except Exception as e:
-
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
-# =========================================================
-# REPLACE API
-# =========================================================
-
-@app.route("/replace", methods=["POST"])
-def replace():
-
-    global FONT_CACHE
-
-    FONT_CACHE = {}
-
-    try:
-
-        data = request.get_json(
-            force=True
-        )
-
-        if not data or not data.get("data"):
-
-            return jsonify({
-                "error": "PDF data missing."
-            }), 400
-
-        pdf_bytes = base64.b64decode(
-            data["data"]
-        )
-
-        if len(pdf_bytes) > MAX_UPLOAD_BYTES:
-
-            return jsonify({
-                "error": "PDF too large. Maximum 25 MB."
-            }), 400
-
-        replacement_map = {}
-
-        for item in (
-            data.get("replacements")
-            or []
-        ):
-
-            old = normalize_digits(
-                item.get("old")
-                or item.get("digits")
-                or item.get("original")
-                or ""
-            )
-
-            new = normalize_digits(
-                item.get("new")
-                or item.get("replacement")
-                or item.get("replacementDigits")
-                or ""
-            )
-
-            if not old or not new:
-                continue
-
-            if len(old) != len(new):
-                continue
-
-            if old == new:
-                continue
-
-            replacement_map[old] = new
-
-        if not replacement_map:
-
-            return jsonify({
-                "error": "No valid replacements supplied."
-            }), 400
-
-        # -------------------------------------------------
-        # OPEN ONCE
-        # -------------------------------------------------
 
         doc = fitz.open(
             stream=pdf_bytes,
             filetype="pdf"
         )
 
-        total_pages = len(doc)
+        found = {}
 
-        pages_processed, numbers_replaced = (
-            replace_pdf(
-                doc,
-                replacement_map
+        for page_index in range(
+            len(doc)
+        ):
+
+            page = doc[page_index]
+
+            candidates = detect_numbers(
+                page
             )
-        )
 
-        # -------------------------------------------------
-        # FAST SAVE
-        # -------------------------------------------------
+            for candidate in candidates:
 
-        output = io.BytesIO()
+                digits = candidate_digits(
+                    candidate
+                )
 
-        doc.save(
-            output,
-            garbage=0,
-            deflate=True
-        )
+                if not (
+                    8 <= len(digits) <= 15
+                ):
+                    continue
+
+                raw = candidate_text(
+                    candidate
+                )
+
+                if digits not in found:
+
+                    found[digits] = {
+
+                        "number":
+                            digits,
+
+                        "country":
+                            detect_country(
+                                digits
+                            ),
+
+                        "count":
+                            0,
+
+                        "variants":
+                            []
+
+                    }
+
+                found[digits]["count"] += 1
+
+                if (
+                    raw
+                    not in
+                    found[digits]["variants"]
+                ):
+
+                    found[digits]["variants"].append(
+                        raw
+                    )
 
         doc.close()
 
-        output.seek(0)
-
-        result_bytes = output.read()
-
-        encoded = base64.b64encode(
-            result_bytes
-        ).decode("ascii")
-
-        original_name = data.get(
-            "fileName",
-            "uploaded.pdf"
+        numbers = list(
+            found.values()
         )
 
-        base_name = os.path.splitext(
-            original_name
-        )[0]
+        numbers.sort(
+            key=lambda x: x["count"],
+            reverse=True
+        )
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
-            "data": encoded,
-
-            "fileName":
-                base_name +
-                "_replaced.pdf",
-
-            "pagesProcessed":
-                pages_processed,
-
-            "totalPages":
-                total_pages,
-
-            "numbersReplaced":
-                numbers_replaced
+            "numbers":
+                numbers
 
         })
 
@@ -802,16 +369,614 @@ def replace():
         }), 500
 
 
-# =========================================================
+# =================================================
+# FONT EXTRACTION
+# =================================================
+
+def get_font_file(
+    doc,
+    page,
+    font_name,
+    font_cache,
+    temp_files
+):
+
+    if font_name in font_cache:
+
+        return font_cache[
+            font_name
+        ]
+
+    fonts = page.get_fonts(
+        full=True
+    )
+
+    for font in fonts:
+
+        xref = font[0]
+        basefont = font[3]
+
+        if (
+            basefont == font_name
+            or font_name in basefont
+            or basefont in font_name
+        ):
+
+            try:
+
+                info = doc.extract_font(
+                    xref
+                )
+
+                if (
+                    info
+                    and len(info) >= 4
+                ):
+
+                    font_bytes = info[3]
+
+                    if font_bytes:
+
+                        suffix = (
+                            ".ttf"
+                            if str(
+                                info[1]
+                            ).lower()
+                            in (
+                                "ttf",
+                                "truetype"
+                            )
+                            else ".otf"
+                        )
+
+                        temp =
+                            tempfile.NamedTemporaryFile(
+                                delete=False,
+                                suffix=suffix
+                            )
+
+                        temp.write(
+                            font_bytes
+                        )
+
+                        temp.close()
+
+                        font_cache[
+                            font_name
+                        ] = temp.name
+
+                        temp_files.append(
+                            temp.name
+                        )
+
+                        return temp.name
+
+            except Exception:
+
+                pass
+
+    font_cache[
+        font_name
+    ] = None
+
+    return None
+
+
+# =================================================
+# EXACT DIGIT REPLACEMENT
+# =================================================
+
+def replace_character_digit(
+    page,
+    char,
+    new_digit,
+    font_file=None
+):
+
+    x0, y0, x1, y1 = \
+        char["bbox"]
+
+    origin_x, origin_y = \
+        char["origin"]
+
+    rect = fitz.Rect(
+        x0,
+        y0,
+        x1,
+        y1
+    )
+
+    page.add_redact_annot(
+        rect,
+        fill=False,
+        cross_out=False
+    )
+
+    return {
+
+        "origin": (
+            origin_x,
+            origin_y
+        ),
+
+        "size":
+            char["size"],
+
+        "color":
+            char["color"],
+
+        "font":
+            char["font"],
+
+        "font_file":
+            font_file,
+
+        "rect":
+            rect,
+
+        "digit":
+            new_digit
+
+    }
+
+
+# =================================================
+# INSERT REPLACEMENT
+# =================================================
+
+def insert_replacement(
+    page,
+    item
+):
+
+    origin = item["origin"]
+
+    size = item["size"]
+
+    color_int = item["color"]
+
+    r = (
+        (color_int >> 16)
+        & 255
+    ) / 255
+
+    g = (
+        (color_int >> 8)
+        & 255
+    ) / 255
+
+    b = (
+        color_int
+        & 255
+    ) / 255
+
+    color = (
+        r,
+        g,
+        b
+    )
+
+    font_file = item.get(
+        "font_file"
+    )
+
+
+    # ---------------------------------------------
+    # TRY ORIGINAL FONT
+    # ---------------------------------------------
+
+    if font_file:
+
+        try:
+
+            page.insert_text(
+                origin,
+                item["digit"],
+                fontsize=size,
+                color=color,
+                fontfile=font_file,
+                overlay=True
+            )
+
+            return
+
+        except Exception:
+
+            pass
+
+
+    # ---------------------------------------------
+    # FALLBACK FONT
+    # ---------------------------------------------
+
+    try:
+
+        page.insert_text(
+            origin,
+            item["digit"],
+            fontsize=size,
+            color=color,
+            fontname="helv",
+            overlay=True
+        )
+
+    except Exception:
+
+        # Last fallback
+        # Do not crash because of font.
+
+        page.insert_text(
+            origin,
+            item["digit"],
+            fontsize=size,
+            overlay=True
+        )
+
+
+# =================================================
+# REPLACEMENT VALUES
+# =================================================
+
+def get_old_value(item):
+
+    if not isinstance(
+        item,
+        dict
+    ):
+
+        return ""
+
+    return digits_only(
+        item.get("search")
+        or item.get("old")
+        or item.get("from")
+        or item.get("source")
+    )
+
+
+def get_new_value(item):
+
+    if not isinstance(
+        item,
+        dict
+    ):
+
+        return ""
+
+    return digits_only(
+        item.get("replacement")
+        or item.get("new")
+        or item.get("to")
+        or item.get("target")
+    )
+
+
+# =================================================
+# REPLACE
+# =================================================
+
+@app.post("/replace")
+def replace():
+
+    temp_files = []
+
+    try:
+
+        body = request.get_json(
+            force=True
+        )
+
+        if not body:
+
+            return jsonify({
+                "error":
+                    "Request body missing."
+            }), 400
+
+
+        pdf_bytes = clean_base64(
+            body.get("data")
+        )
+
+
+        replacements = body.get(
+            "replacements",
+            []
+        )
+
+
+        replacement_map = {}
+
+
+        for item in replacements:
+
+            old = get_old_value(
+                item
+            )
+
+            new = get_new_value(
+                item
+            )
+
+            if old and new:
+
+                replacement_map[
+                    old
+                ] = new
+
+
+        if not replacement_map:
+
+            return jsonify({
+
+                "error":
+                    "No valid replacements supplied."
+
+            }), 400
+
+
+        # -----------------------------------------
+        # SAME DIGIT COUNT
+        # -----------------------------------------
+
+        for old, new in replacement_map.items():
+
+            if len(old) != len(new):
+
+                return jsonify({
+
+                    "error":
+                        "Replacement must contain the same number of digits as the original.",
+
+                    "original":
+                        old,
+
+                    "replacement":
+                        new
+
+                }), 400
+
+
+        # -----------------------------------------
+        # OPEN PDF
+        # -----------------------------------------
+
+        doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
+
+
+        changed = 0
+
+        font_cache = {}
+
+
+        # -----------------------------------------
+        # PROCESS PAGES
+        # -----------------------------------------
+
+        for page_index in range(
+            len(doc)
+        ):
+
+            page = doc[
+                page_index
+            ]
+
+            candidates = detect_numbers(
+                page
+            )
+
+            pending = []
+
+
+            for candidate in candidates:
+
+                old_digits = \
+                    candidate_digits(
+                        candidate
+                    )
+
+
+                if (
+                    old_digits
+                    not in
+                    replacement_map
+                ):
+
+                    continue
+
+
+                new_digits = \
+                    replacement_map[
+                        old_digits
+                    ]
+
+
+                if (
+                    len(new_digits)
+                    !=
+                    len(old_digits)
+                ):
+
+                    continue
+
+
+                digit_index = 0
+
+
+                for char in candidate:
+
+                    if not char["digit"]:
+                        continue
+
+
+                    if (
+                        digit_index
+                        >=
+                        len(new_digits)
+                    ):
+
+                        break
+
+
+                    new_digit = \
+                        new_digits[
+                            digit_index
+                        ]
+
+
+                    digit_index += 1
+
+
+                    font_file = \
+                        get_font_file(
+                            doc,
+                            page,
+                            char["font"],
+                            font_cache,
+                            temp_files
+                        )
+
+
+                    item = \
+                        replace_character_digit(
+                            page,
+                            char,
+                            new_digit,
+                            font_file
+                        )
+
+
+                    pending.append(
+                        item
+                    )
+
+
+                    changed += 1
+
+
+            # -------------------------------------
+            # APPLY REDACTIONS
+            # -------------------------------------
+
+            if pending:
+
+                page.apply_redactions(
+                    images=0,
+                    graphics=0,
+                    text=0
+                )
+
+
+                for item in pending:
+
+                    insert_replacement(
+                        page,
+                        item
+                    )
+
+
+        # -----------------------------------------
+        # SAVE PDF
+        # -----------------------------------------
+
+        output = io.BytesIO()
+
+
+        doc.save(
+            output,
+            garbage=4,
+            deflate=True,
+            clean=True
+        )
+
+
+        doc.close()
+
+
+        output.seek(0)
+
+
+        encoded = \
+            base64.b64encode(
+                output.read()
+            ).decode("ascii")
+
+
+        return jsonify({
+
+            "success":
+                True,
+
+            "changedCharacters":
+                changed,
+
+            "fileName":
+                make_output_name(
+                    body.get(
+                        "fileName"
+                    )
+                ),
+
+            "data":
+                "data:application/pdf;base64,"
+                + encoded
+
+        })
+
+
+    except Exception as e:
+
+        return jsonify({
+
+            "error":
+                str(e)
+
+        }), 500
+
+
+    finally:
+
+        for path in temp_files:
+
+            try:
+
+                os.unlink(
+                    path
+                )
+
+            except Exception:
+
+                pass
+
+
+# =================================================
+# HEALTH
+# =================================================
+
+@app.get("/")
+def home():
+
+    return jsonify({
+
+        "status":
+            "PDF Number Engine running"
+
+    })
+
+
+# =================================================
 # START
-# =========================================================
+# =================================================
 
 if __name__ == "__main__":
 
     port = int(
         os.environ.get(
             "PORT",
-            "10000"
+            "8080"
         )
     )
 
