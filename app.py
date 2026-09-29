@@ -14,7 +14,6 @@ PHONE_REGEX = re.compile(
     r"(?:\+?\d(?:[^A-Za-z0-9\r\n]{0,8}\d){7,14})"
 )
 
-# Punctuation/separators allowed inside a phone number.
 SEPARATORS = set(" +-()./#@_|\\*[]{}:'\",;")
 
 FONT_CACHE = {}
@@ -25,39 +24,34 @@ def normalize_digits(value):
 
 
 def country_from_digits(digits):
-    if digits.startswith("52"):
-        return "Mexico"
-    if digits.startswith("1"):
-        return "United States / Canada"
-    if digits.startswith("44"):
-        return "United Kingdom"
-    if digits.startswith("91"):
-        return "India"
-    if digits.startswith("971"):
-        return "United Arab Emirates"
-    if digits.startswith("92"):
-        return "Pakistan"
-    if digits.startswith("61"):
-        return "Australia"
-    if digits.startswith("49"):
-        return "Germany"
-    if digits.startswith("33"):
-        return "France"
-    if digits.startswith("39"):
-        return "Italy"
-    if digits.startswith("81"):
-        return "Japan"
-    if digits.startswith("86"):
-        return "China"
+    countries = {
+        "52": "Mexico",
+        "1": "United States / Canada",
+        "44": "United Kingdom",
+        "91": "India",
+        "971": "United Arab Emirates",
+        "92": "Pakistan",
+        "61": "Australia",
+        "49": "Germany",
+        "33": "France",
+        "39": "Italy",
+        "81": "Japan",
+        "86": "China",
+    }
+
+    for prefix, country in countries.items():
+        if digits.startswith(prefix):
+            return country
 
     return "Unknown"
 
 
-# ---------------------------------------------------------
+# =========================================================
 # ANALYZE
-# ---------------------------------------------------------
+# =========================================================
 
 def analyze_pdf(pdf_bytes):
+
     doc = fitz.open(
         stream=pdf_bytes,
         filetype="pdf"
@@ -66,20 +60,25 @@ def analyze_pdf(pdf_bytes):
     found = {}
 
     try:
+
         for page in doc:
+
             text = page.get_text(
                 "text",
                 sort=True
             )
 
             for match in PHONE_REGEX.finditer(text):
+
                 raw = match.group(0)
+
                 digits = normalize_digits(raw)
 
-                if len(digits) < 8 or len(digits) > 15:
+                if not 8 <= len(digits) <= 15:
                     continue
 
                 if digits not in found:
+
                     found[digits] = {
                         "digits": digits,
                         "country": country_from_digits(digits),
@@ -101,11 +100,12 @@ def analyze_pdf(pdf_bytes):
         doc.close()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # FAST PAGE FILTER
-# ---------------------------------------------------------
+# =========================================================
 
 def page_has_target(page, targets):
+
     text = page.get_text(
         "text",
         sort=True
@@ -113,18 +113,18 @@ def page_has_target(page, targets):
 
     digits = normalize_digits(text)
 
-    for target in targets:
-        if target in digits:
-            return True
+    return any(
+        target in digits
+        for target in targets
+    )
 
-    return False
 
-
-# ---------------------------------------------------------
-# FONT
-# ---------------------------------------------------------
+# =========================================================
+# FONT CACHE
+# =========================================================
 
 def get_font_file(doc, page, font_name):
+
     if not font_name:
         return None
 
@@ -132,7 +132,9 @@ def get_font_file(doc, page, font_name):
         return FONT_CACHE[font_name]
 
     try:
+
         for font in page.get_fonts(full=True):
+
             xref = font[0]
             basefont = font[3] or ""
             short_name = font[4] or ""
@@ -150,17 +152,17 @@ def get_font_file(doc, page, font_name):
             if not extracted:
                 continue
 
-            font_name_out = extracted[0]
-            extension = extracted[1] or "ttf"
+            name = extracted[0] or "font"
+            ext = extracted[1] or "ttf"
             content = extracted[3]
 
             if not content:
                 continue
 
-            safe_name = re.sub(
+            safe = re.sub(
                 r"[^A-Za-z0-9_-]",
                 "_",
-                font_name_out or "font"
+                name
             )
 
             path = os.path.join(
@@ -168,12 +170,13 @@ def get_font_file(doc, page, font_name):
                 "pdf_font_" +
                 str(xref) +
                 "_" +
-                safe_name +
+                safe +
                 "." +
-                extension
+                ext
             )
 
             if not os.path.exists(path):
+
                 with open(path, "wb") as f:
                     f.write(content)
 
@@ -189,49 +192,50 @@ def get_font_file(doc, page, font_name):
     return None
 
 
-# ---------------------------------------------------------
-# COLOR
-# ---------------------------------------------------------
-
 def color_from_int(value):
+
     try:
+
         value = int(value or 0)
 
-        r = ((value >> 16) & 255) / 255.0
-        g = ((value >> 8) & 255) / 255.0
-        b = (value & 255) / 255.0
-
-        return (r, g, b)
+        return (
+            ((value >> 16) & 255) / 255,
+            ((value >> 8) & 255) / 255,
+            (value & 255) / 255
+        )
 
     except Exception:
+
         return (0, 0, 0)
 
 
-# ---------------------------------------------------------
-# FIND PHONE OCCURRENCES
-#
-# IMPORTANT:
-# We create DIGIT RUNS.
+# =========================================================
+# FIND COMPLETE PHONE OCCURRENCES
 #
 # Example:
 #
 # +52-800-461-1544
 #
-# becomes:
+# Old digits:
+# 528004611544
 #
-# 52 | 800 | 461 | 1544
+# New digits:
+# 528004611460
 #
-# Punctuation is never included in redaction.
-# ---------------------------------------------------------
+# Result:
+# +52-800-461-1460
+#
+# The ORIGINAL separators are copied from the PDF.
+# =========================================================
 
-def find_phone_occurrences(page, targets):
+def find_occurrences(page, targets):
 
     raw = page.get_text(
         "rawdict",
         sort=True
     )
 
-    occurrences = []
+    results = []
 
     for block in raw.get("blocks", []):
 
@@ -265,42 +269,36 @@ def find_phone_occurrences(page, targets):
                 continue
 
             # -------------------------------------------------
-            # Build digit sequence while remembering positions.
+            # Build normalized digit stream.
             # -------------------------------------------------
 
             digit_positions = []
             digit_string = ""
 
-            broken = False
-
-            for index, item in enumerate(chars):
+            for i, item in enumerate(chars):
 
                 c = item["c"]
 
                 if c.isdigit():
 
-                    digit_positions.append(index)
+                    digit_positions.append(i)
                     digit_string += c
 
                 elif c in SEPARATORS or c.isspace():
 
-                    # Allowed inside number.
                     continue
 
                 else:
 
-                    # Letters / unrelated characters break sequence.
-                    broken = True
-                    break
-
-            if broken:
-                continue
+                    # Do not join across unrelated text.
+                    digit_positions = []
+                    digit_string = ""
 
             if not digit_string:
                 continue
 
             # -------------------------------------------------
-            # Find every target in this line.
+            # Find target.
             # -------------------------------------------------
 
             for target in targets:
@@ -309,95 +307,120 @@ def find_phone_occurrences(page, targets):
 
                 while True:
 
-                    position = digit_string.find(
+                    pos = digit_string.find(
                         target,
                         start
                     )
 
-                    if position < 0:
+                    if pos == -1:
                         break
 
-                    end = position + len(target)
+                    end = pos + len(target)
 
                     selected_positions = digit_positions[
-                        position:end
+                        pos:end
                     ]
 
                     if len(selected_positions) != len(target):
-                        start = position + 1
+
+                        start = pos + 1
                         continue
 
-                    selected_chars = [
-                        chars[p]
-                        for p in selected_positions
+                    first_pos = selected_positions[0]
+                    last_pos = selected_positions[-1]
+
+                    # Complete original visual substring.
+                    selected_chars = chars[
+                        first_pos:last_pos + 1
                     ]
 
-                    # -------------------------------------------------
-                    # Build digit RUNS.
-                    #
-                    # 528004611544
-                    #
-                    # becomes:
-                    #
-                    # 52
-                    # 800
-                    # 461
-                    # 1544
-                    # -------------------------------------------------
+                    # Make sure nothing unrelated is inside.
+                    valid = True
 
-                    runs = []
+                    for item in selected_chars:
 
-                    current_run = []
+                        c = item["c"]
 
-                    previous_position = None
+                        if (
+                            not c.isdigit()
+                            and not c.isspace()
+                            and c not in SEPARATORS
+                        ):
+                            valid = False
+                            break
 
-                    for char_info, original_pos in zip(
-                        selected_chars,
-                        selected_positions
-                    ):
+                    if not valid:
 
-                        if previous_position is None:
-                            current_run = [
-                                char_info
-                            ]
+                        start = pos + 1
+                        continue
 
-                        elif original_pos == previous_position + 1:
-                            current_run.append(
-                                char_info
-                            )
+                    # Original formatted string.
+                    original_text = "".join(
+                        item["c"]
+                        for item in selected_chars
+                    )
 
-                        else:
-                            if current_run:
-                                runs.append(
-                                    current_run
-                                )
+                    first = selected_chars[0]
 
-                            current_run = [
-                                char_info
-                            ]
+                    last = selected_chars[-1]
 
-                        previous_position = original_pos
+                    # Bounding box of the COMPLETE occurrence.
+                    valid_boxes = [
+                        item["bbox"]
+                        for item in selected_chars
+                        if item.get("bbox")
+                    ]
 
-                    if current_run:
-                        runs.append(
-                            current_run
-                        )
+                    if not valid_boxes:
 
-                    occurrences.append({
+                        start = pos + 1
+                        continue
+
+                    x0 = min(
+                        box[0]
+                        for box in valid_boxes
+                    )
+
+                    y0 = min(
+                        box[1]
+                        for box in valid_boxes
+                    )
+
+                    x1 = max(
+                        box[2]
+                        for box in valid_boxes
+                    )
+
+                    y1 = max(
+                        box[3]
+                        for box in valid_boxes
+                    )
+
+                    results.append({
                         "old": target,
-                        "runs": runs
+                        "original_text": original_text,
+                        "rect": fitz.Rect(
+                            x0,
+                            y0,
+                            x1,
+                            y1
+                        ),
+                        "origin": first["origin"],
+                        "font": first["font"],
+                        "size": first["size"],
+                        "color": first["color"]
                     })
 
-                    start = position + len(target)
+                    start = pos + len(target)
 
-    return occurrences
+    return results
 
 
-# ---------------------------------------------------------
-# APPLY FAST REPLACEMENT
-# ---------------------------------------------------------
+# =========================================================
+# REPLACE
+# =========================================================
 
-def replace_on_pages(doc, replacement_map):
+def replace_pdf(doc, replacement_map):
 
     targets = list(
         replacement_map.keys()
@@ -405,20 +428,19 @@ def replace_on_pages(doc, replacement_map):
 
     pages_processed = 0
     occurrences_replaced = 0
-    runs_replaced = 0
 
     for page_number in range(len(doc)):
 
         page = doc[page_number]
 
-        # Very cheap first filter.
+        # Very fast page filter.
         if not page_has_target(
             page,
             targets
         ):
             continue
 
-        occurrences = find_phone_occurrences(
+        occurrences = find_occurrences(
             page,
             targets
         )
@@ -426,146 +448,110 @@ def replace_on_pages(doc, replacement_map):
         if not occurrences:
             continue
 
-        page_redactions = []
-        page_insertions = []
+        page_actions = []
+
+        # -------------------------------------------------
+        # Prepare each occurrence.
+        # -------------------------------------------------
 
         for occurrence in occurrences:
 
             old = occurrence["old"]
-            new = replacement_map.get(old)
 
-            if not new:
+            new_digits = replacement_map.get(old)
+
+            if not new_digits:
                 continue
 
-            # Exact digit count is mandatory.
-            if len(old) != len(new):
+            if len(old) != len(new_digits):
                 continue
 
-            runs = occurrence["runs"]
+            original_text = occurrence[
+                "original_text"
+            ]
 
-            # Safety check.
-            total_digits = sum(
-                len(run)
-                for run in runs
+            # -------------------------------------------------
+            # Preserve EVERY original non-digit character.
+            #
+            # Example:
+            #
+            # +52-800-461-1544
+            #
+            # becomes:
+            #
+            # +52-800-461-1460
+            # -------------------------------------------------
+
+            digit_index = 0
+            new_text_parts = []
+
+            for c in original_text:
+
+                if c.isdigit():
+
+                    if digit_index >= len(new_digits):
+                        break
+
+                    new_text_parts.append(
+                        new_digits[digit_index]
+                    )
+
+                    digit_index += 1
+
+                else:
+
+                    new_text_parts.append(c)
+
+            if digit_index != len(new_digits):
+                continue
+
+            new_text = "".join(
+                new_text_parts
             )
 
-            if total_digits != len(old):
-                continue
+            page_actions.append({
+                "rect": occurrence["rect"],
+                "text": new_text,
+                "origin": occurrence["origin"],
+                "font": occurrence["font"],
+                "size": occurrence["size"],
+                "color": occurrence["color"]
+            })
 
-            # -------------------------------------------------
-            # Each digit run gets ONE redaction rectangle
-            # and ONE text insertion.
-            # -------------------------------------------------
-
-            digit_offset = 0
-
-            for run in runs:
-
-                if not run:
-                    continue
-
-                run_digits = len(run)
-
-                replacement_run = new[
-                    digit_offset:
-                    digit_offset + run_digits
-                ]
-
-                digit_offset += run_digits
-
-                first_bbox = run[0]["bbox"]
-                last_bbox = run[-1]["bbox"]
-
-                if not first_bbox or not last_bbox:
-                    continue
-
-                # Rectangle covering ONLY this digit run.
-                x0 = min(
-                    c["bbox"][0]
-                    for c in run
-                    if c.get("bbox")
-                )
-
-                y0 = min(
-                    c["bbox"][1]
-                    for c in run
-                    if c.get("bbox")
-                )
-
-                x1 = max(
-                    c["bbox"][2]
-                    for c in run
-                    if c.get("bbox")
-                )
-
-                y1 = max(
-                    c["bbox"][3]
-                    for c in run
-                    if c.get("bbox")
-                )
-
-                rect = fitz.Rect(
-                    x0,
-                    y0,
-                    x1,
-                    y1
-                )
-
-                page_redactions.append(
-                    rect
-                )
-
-                first = run[0]
-
-                page_insertions.append({
-                    "text": replacement_run,
-                    "origin": first["origin"],
-                    "font": first["font"],
-                    "size": first["size"],
-                    "color": first["color"]
-                })
-
-                runs_replaced += 1
-
-            occurrences_replaced += 1
-
-        if not page_redactions:
+        if not page_actions:
             continue
 
         pages_processed += 1
 
-        # -----------------------------------------------------
-        # Add ALL redactions first.
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # ONE REDACTION PER COMPLETE PHONE NUMBER.
+        # -------------------------------------------------
 
-        for rect in page_redactions:
+        for action in page_actions:
 
             page.add_redact_annot(
-                rect,
+                action["rect"],
                 fill=False,
                 cross_out=False
             )
 
-        # -----------------------------------------------------
-        # ONE redaction pass per page.
-        # -----------------------------------------------------
-
+        # ONE redaction pass for entire page.
         page.apply_redactions(
             images=0,
             graphics=0,
             text=0
         )
 
-        # -----------------------------------------------------
-        # Reinsert replacement RUNS.
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # ONE INSERTION PER PHONE NUMBER.
+        # -------------------------------------------------
 
-        for item in page_insertions:
+        for action in page_actions:
 
             font_file = get_font_file(
                 doc,
                 page,
-                item["font"]
+                action["font"]
             )
 
             inserted = False
@@ -575,12 +561,12 @@ def replace_on_pages(doc, replacement_map):
                 try:
 
                     page.insert_text(
-                        item["origin"],
-                        item["text"],
+                        action["origin"],
+                        action["text"],
                         fontfile=font_file,
-                        fontsize=item["size"],
+                        fontsize=action["size"],
                         color=color_from_int(
-                            item["color"]
+                            action["color"]
                         ),
                         overlay=True
                     )
@@ -588,19 +574,19 @@ def replace_on_pages(doc, replacement_map):
                     inserted = True
 
                 except Exception:
-                    inserted = False
+                    pass
 
             if not inserted:
 
                 try:
 
                     page.insert_text(
-                        item["origin"],
-                        item["text"],
+                        action["origin"],
+                        action["text"],
                         fontname="helv",
-                        fontsize=item["size"],
+                        fontsize=action["size"],
                         color=color_from_int(
-                            item["color"]
+                            action["color"]
                         ),
                         overlay=True
                     )
@@ -608,16 +594,17 @@ def replace_on_pages(doc, replacement_map):
                 except Exception:
                     pass
 
+            occurrences_replaced += 1
+
     return (
         pages_processed,
-        occurrences_replaced,
-        runs_replaced
+        occurrences_replaced
     )
 
 
-# ---------------------------------------------------------
-# HEALTH
-# ---------------------------------------------------------
+# =========================================================
+# HOME
+# =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
@@ -627,9 +614,9 @@ def home():
     })
 
 
-# ---------------------------------------------------------
-# ANALYZE API
-# ---------------------------------------------------------
+# =========================================================
+# ANALYZE
+# =========================================================
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -656,11 +643,9 @@ def analyze():
                 "error": "PDF too large. Maximum 25 MB."
             }), 400
 
-        result = analyze_pdf(
-            pdf_bytes
+        return jsonify(
+            analyze_pdf(pdf_bytes)
         )
-
-        return jsonify(result)
 
     except Exception as e:
 
@@ -669,9 +654,9 @@ def analyze():
         }), 500
 
 
-# ---------------------------------------------------------
+# =========================================================
 # REPLACE API
-# ---------------------------------------------------------
+# =========================================================
 
 @app.route("/replace", methods=["POST"])
 def replace():
@@ -702,14 +687,12 @@ def replace():
                 "error": "PDF too large. Maximum 25 MB."
             }), 400
 
-        replacements = (
-            data.get("replacements")
-            or []
-        )
-
         replacement_map = {}
 
-        for item in replacements:
+        for item in (
+            data.get("replacements")
+            or []
+        ):
 
             old = normalize_digits(
                 item.get("old")
@@ -728,7 +711,6 @@ def replace():
             if not old or not new:
                 continue
 
-            # Same number of digits only.
             if len(old) != len(new):
                 continue
 
@@ -744,7 +726,7 @@ def replace():
             }), 400
 
         # -------------------------------------------------
-        # OPEN PDF ONCE.
+        # OPEN ONCE
         # -------------------------------------------------
 
         doc = fitz.open(
@@ -754,24 +736,22 @@ def replace():
 
         total_pages = len(doc)
 
-        (
-            pages_processed,
-            occurrences_replaced,
-            runs_replaced
-        ) = replace_on_pages(
-            doc,
-            replacement_map
+        pages_processed, numbers_replaced = (
+            replace_pdf(
+                doc,
+                replacement_map
+            )
         )
 
         # -------------------------------------------------
-        # FAST SAVE.
+        # FAST SAVE
         # -------------------------------------------------
 
         output = io.BytesIO()
 
         doc.save(
             output,
-            garbage=1,
+            garbage=0,
             deflate=True
         )
 
@@ -785,11 +765,9 @@ def replace():
             result_bytes
         ).decode("ascii")
 
-        original_name = (
-            data.get(
-                "fileName",
-                "uploaded.pdf"
-            )
+        original_name = data.get(
+            "fileName",
+            "uploaded.pdf"
         )
 
         base_name = os.path.splitext(
@@ -813,10 +791,7 @@ def replace():
                 total_pages,
 
             "numbersReplaced":
-                occurrences_replaced,
-
-            "digitRunsReplaced":
-                runs_replaced
+                numbers_replaced
 
         })
 
@@ -827,9 +802,9 @@ def replace():
         }), 500
 
 
-# ---------------------------------------------------------
-# LOCAL SERVER
-# ---------------------------------------------------------
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
 
