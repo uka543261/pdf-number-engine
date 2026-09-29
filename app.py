@@ -9,6 +9,19 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# -------------------------------------------------
+# SETTINGS
+# -------------------------------------------------
+
+MIN_DIGITS = 8
+MAX_DIGITS = 15
+
+# Digits ke beech maximum special formatting characters.
+# Example:
+# +52-800-461-1544
+# +52/800)-(461)#@1544
+MAX_SEPARATOR_CHARS = 8
+
 
 # -------------------------------------------------
 # BASIC HELPERS
@@ -42,57 +55,224 @@ def make_output_name(name):
 
 
 # -------------------------------------------------
-# UNICODE DIGIT NORMALIZATION
+# COUNTRY
 # -------------------------------------------------
 
-UNICODE_DIGIT_MAP = {}
+def detect_country(number):
+    number = str(number)
 
-for block_start in (
-    0x0660,
-    0x06F0,
-    0x0966,
-    0x09E6,
-    0x0AE6,
-    0x0BE6,
-    0x0C66,
-    0x0CE6,
-    0x0D66,
-    0x0DE6
-):
-    for i in range(10):
-        UNICODE_DIGIT_MAP[
-            chr(block_start + i)
-        ] = chr(0x30 + i)
+    if number.startswith("52"):
+        return "Mexico"
+
+    if number.startswith("57"):
+        return "Colombia"
+
+    if number.startswith("54"):
+        return "Argentina"
+
+    if number.startswith("34"):
+        return "Spain"
+
+    if number.startswith("56"):
+        return "Chile"
+
+    if number.startswith("51"):
+        return "Peru"
+
+    if number.startswith("44"):
+        return "UK"
+
+    if number.startswith("1"):
+        return "USA / Canada"
+
+    return "Unknown"
 
 
-def normalize_digit(ch):
-    if ch in UNICODE_DIGIT_MAP:
-        return UNICODE_DIGIT_MAP[ch]
+# -------------------------------------------------
+# FAST PHONE DETECTION
+#
+# Analysis ke waqt rawdict use nahi karna.
+# Normal PDF text extraction much faster hai.
+# -------------------------------------------------
 
-    if "0" <= ch <= "9":
-        return ch
+PHONE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"\+?"
+    r"\d"
+    r"(?:"
+        r"[^A-Za-z0-9\r\n]{0," +
+        str(MAX_SEPARATOR_CHARS) +
+        r"}"
+        r"\d"
+    r"){7,14}"
+    r"(?![A-Za-z0-9])"
+)
 
-    return None
+
+def extract_text_fast(page):
+    """
+    Fast text extraction.
+    rawdict nahi use karta.
+    """
+    try:
+        return page.get_text(
+            "text",
+            sort=True
+        ) or ""
+    except Exception:
+        return ""
+
+
+def find_numbers_fast(text):
+    found = []
+
+    if not text:
+        return found
+
+    # Normal lines
+    for match in PHONE_PATTERN.finditer(text):
+
+        raw = match.group(0).strip()
+
+        digits = digits_only(raw)
+
+        if (
+            MIN_DIGITS
+            <= len(digits)
+            <= MAX_DIGITS
+        ):
+            found.append(
+                (
+                    raw,
+                    digits
+                )
+            )
+
+    return found
+
+
+# -------------------------------------------------
+# ANALYZE
+# -------------------------------------------------
+
+@app.post("/analyze")
+def analyze():
+
+    try:
+
+        body = request.get_json(
+            force=True
+        )
+
+        pdf_bytes = clean_base64(
+            body.get("data")
+        )
+
+        if not pdf_bytes:
+            return jsonify({
+                "error": "PDF data missing."
+            }), 400
+
+        doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
+
+        found = {}
+
+        for page in doc:
+
+            text = extract_text_fast(
+                page
+            )
+
+            matches = find_numbers_fast(
+                text
+            )
+
+            for raw, digits in matches:
+
+                if digits not in found:
+
+                    found[digits] = {
+                        "number": digits,
+                        "country": detect_country(
+                            digits
+                        ),
+                        "count": 0,
+                        "variants": []
+                    }
+
+                found[digits][
+                    "count"
+                ] += 1
+
+                if (
+                    raw not in
+                    found[digits][
+                        "variants"
+                    ]
+                ):
+
+                    found[digits][
+                        "variants"
+                    ].append(raw)
+
+        doc.close()
+
+        numbers = list(
+            found.values()
+        )
+
+        numbers.sort(
+            key=lambda x:
+                x["count"],
+            reverse=True
+        )
+
+        return jsonify({
+            "success": True,
+            "numbers": numbers
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
 # -------------------------------------------------
 # CHARACTER EXTRACTION
+#
+# Ye sirf replacement ke waqt chalega.
 # -------------------------------------------------
 
 def page_characters(page):
 
-    data = page.get_text("rawdict")
+    data = page.get_text(
+        "rawdict"
+    )
 
     output = []
 
-    for block in data.get("blocks", []):
+    for block in data.get(
+        "blocks",
+        []
+    ):
 
         if block.get("type") != 0:
             continue
 
-        for line in block.get("lines", []):
+        for line in block.get(
+            "lines",
+            []
+        ):
 
-            for span in line.get("spans", []):
+            for span in line.get(
+                "spans",
+                []
+            ):
 
                 font = span.get(
                     "font",
@@ -109,11 +289,6 @@ def page_characters(page):
                     0
                 )
 
-                flags = span.get(
-                    "flags",
-                    0
-                )
-
                 for ch in span.get(
                     "chars",
                     []
@@ -124,9 +299,6 @@ def page_characters(page):
                         ""
                     )
 
-                    if not char:
-                        continue
-
                     bbox = ch.get(
                         "bbox"
                     )
@@ -135,11 +307,17 @@ def page_characters(page):
                         "origin"
                     )
 
-                    if not bbox or not origin:
+                    if (
+                        not char
+                        or not bbox
+                        or not origin
+                    ):
                         continue
 
-                    digit = normalize_digit(
+                    digit = (
                         char
+                        if char.isdigit()
+                        else None
                     )
 
                     output.append({
@@ -160,70 +338,54 @@ def page_characters(page):
 
                         "size": size,
 
-                        "color": color,
-
-                        "flags": flags
+                        "color": color
                     })
 
     return output
 
 
 # -------------------------------------------------
-# NUMBER HELPERS
+# FIND PHONE NUMBERS FROM PDF CHARACTERS
 # -------------------------------------------------
 
-def candidate_digits(
-    candidate
-):
+def candidate_digits(candidate):
 
     return "".join(
-        x["digit"]
-        for x in candidate
-        if x["digit"]
+        item["digit"]
+        for item in candidate
+        if item["digit"]
     )
 
 
-def candidate_text(
-    candidate
-):
+def candidate_text(candidate):
 
     return "".join(
-        x["char"]
-        for x in candidate
+        item["char"]
+        for item in candidate
     )
 
 
-# -------------------------------------------------
-# NUMBER DETECTION
-# -------------------------------------------------
-
-def detect_numbers(page):
+def detect_numbers_from_chars(page):
 
     chars = page_characters(
         page
     )
 
+    # Group characters by visual line.
     lines = {}
 
     for item in chars:
 
-        y = round(
-            item["bbox"][1],
-            1
-        )
+        y = item["bbox"][1]
 
         key = int(
-            round(
-                y / 2.0
-            )
+            round(y / 2.0)
         )
 
         lines.setdefault(
             key,
             []
-        ).append(
-            item
-        )
+        ).append(item)
 
     results = []
 
@@ -238,7 +400,7 @@ def detect_numbers(page):
 
         for item in line_chars:
 
-            ch = item["char"]
+            char = item["char"]
 
             if item["digit"]:
 
@@ -248,10 +410,11 @@ def detect_numbers(page):
 
                 continue
 
+            # Allowed formatting characters.
             if (
-                ch.isspace()
-                or ch in
-                "+-()[]{}./#@*_:" 
+                char.isspace()
+                or char in
+                "+-()[]{}./#@*_:=;"
             ):
 
                 continue
@@ -263,9 +426,9 @@ def detect_numbers(page):
                 )
 
                 if (
-                    8 <=
-                    len(digits)
-                    <= 15
+                    MIN_DIGITS
+                    <= len(digits)
+                    <= MAX_DIGITS
                 ):
 
                     results.append(
@@ -281,9 +444,9 @@ def detect_numbers(page):
             )
 
             if (
-                8 <=
-                len(digits)
-                <= 15
+                MIN_DIGITS
+                <= len(digits)
+                <= MAX_DIGITS
             ):
 
                 results.append(
@@ -294,192 +457,22 @@ def detect_numbers(page):
 
 
 # -------------------------------------------------
-# COUNTRY
-# -------------------------------------------------
-
-def detect_country(
-    number
-):
-
-    if number.startswith(
-        "52"
-    ):
-        return "Mexico"
-
-    if number.startswith(
-        "57"
-    ):
-        return "Colombia"
-
-    if number.startswith(
-        "54"
-    ):
-        return "Argentina"
-
-    if number.startswith(
-        "34"
-    ):
-        return "Spain"
-
-    if number.startswith(
-        "56"
-    ):
-        return "Chile"
-
-    if number.startswith(
-        "51"
-    ):
-        return "Peru"
-
-    if number.startswith(
-        "44"
-    ):
-        return "UK"
-
-    if number.startswith(
-        "1"
-    ):
-        return "USA / Canada"
-
-    return "Unknown"
-
-
-# -------------------------------------------------
-# ANALYZE PDF
-# -------------------------------------------------
-
-@app.post("/analyze")
-def analyze():
-
-    try:
-
-        body = request.get_json(
-            force=True
-        )
-
-        pdf_bytes = clean_base64(
-            body.get("data")
-        )
-
-        doc = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-
-        found = {}
-
-        for page_index in range(
-            len(doc)
-        ):
-
-            page = doc[
-                page_index
-            ]
-
-            candidates = detect_numbers(
-                page
-            )
-
-            for candidate in candidates:
-
-                digits = candidate_digits(
-                    candidate
-                )
-
-                if not (
-                    8 <=
-                    len(digits)
-                    <= 15
-                ):
-
-                    continue
-
-                raw = candidate_text(
-                    candidate
-                )
-
-                if digits not in found:
-
-                    found[digits] = {
-
-                        "number":
-                            digits,
-
-                        "country":
-                            detect_country(
-                                digits
-                            ),
-
-                        "count":
-                            0,
-
-                        "variants":
-                            []
-                    }
-
-                found[
-                    digits
-                ][
-                    "count"
-                ] += 1
-
-                if (
-                    raw not in
-                    found[
-                        digits
-                    ][
-                        "variants"
-                    ]
-                ):
-
-                    found[
-                        digits
-                    ][
-                        "variants"
-                    ].append(
-                        raw
-                    )
-
-        doc.close()
-
-        numbers = list(
-            found.values()
-        )
-
-        numbers.sort(
-            key=lambda x:
-                x["count"],
-            reverse=True
-        )
-
-        return jsonify({
-
-            "success":
-                True,
-
-            "numbers":
-                numbers
-        })
-
-    except Exception as e:
-
-        return jsonify({
-
-            "error":
-                str(e)
-
-        }), 500
-
-
-# -------------------------------------------------
-# FONT EXTRACTION
+# FONT CACHE
 # -------------------------------------------------
 
 def get_font_file(
     doc,
     page,
-    font_name
+    font_name,
+    cache
 ):
+
+    cache_key = str(
+        font_name
+    )
+
+    if cache_key in cache:
+        return cache[cache_key]
 
     fonts = page.get_fonts(
         full=True
@@ -488,20 +481,12 @@ def get_font_file(
     for font in fonts:
 
         xref = font[0]
-
         basefont = font[3]
 
         if (
-            basefont ==
-            font_name
-
-            or
-            font_name in
-            basefont
-
-            or
-            basefont in
-            font_name
+            basefont == font_name
+            or font_name in basefont
+            or basefont in font_name
         ):
 
             try:
@@ -512,8 +497,7 @@ def get_font_file(
 
                 if (
                     info
-                    and
-                    len(info) >= 4
+                    and len(info) >= 4
                 ):
 
                     font_bytes = info[3]
@@ -546,24 +530,31 @@ def get_font_file(
 
                         temp.close()
 
+                        cache[
+                            cache_key
+                        ] = temp.name
+
                         return temp.name
 
             except Exception:
-
                 pass
+
+    cache[
+        cache_key
+    ] = None
 
     return None
 
 
 # -------------------------------------------------
-# REPLACE ONE CHARACTER
+# REPLACE ONE DIGIT
 # -------------------------------------------------
 
-def replace_character_digit(
+def prepare_replacement(
     page,
     char,
     new_digit,
-    font_file=None
+    font_file
 ):
 
     x0, y0, x1, y1 = char[
@@ -600,36 +591,18 @@ def replace_character_digit(
         "color":
             char["color"],
 
-        "font":
-            char["font"],
-
         "font_file":
             font_file,
-
-        "rect":
-            rect,
 
         "digit":
             new_digit
     }
 
 
-# -------------------------------------------------
-# INSERT REPLACEMENT CHARACTER
-# -------------------------------------------------
-
 def insert_replacement(
     page,
     item
 ):
-
-    origin = item[
-        "origin"
-    ]
-
-    size = item[
-        "size"
-    ]
 
     color_int = item[
         "color"
@@ -638,39 +611,33 @@ def insert_replacement(
     r = (
         (color_int >> 16)
         & 255
-    ) / 255
+    ) / 255.0
 
     g = (
         (color_int >> 8)
         & 255
-    ) / 255
+    ) / 255.0
 
     b = (
         color_int
         & 255
-    ) / 255
-
-    color = (
-        r,
-        g,
-        b
-    )
-
-    font_file = item.get(
-        "font_file"
-    )
+    ) / 255.0
 
     kwargs = {
 
         "fontsize":
-            size,
+            item["size"],
 
         "color":
-            color,
+            (r, g, b),
 
         "overlay":
             True
     }
+
+    font_file = item.get(
+        "font_file"
+    )
 
     if font_file:
 
@@ -685,14 +652,14 @@ def insert_replacement(
         ] = "helv"
 
     page.insert_text(
-        origin,
+        item["origin"],
         item["digit"],
         **kwargs
     )
 
 
 # -------------------------------------------------
-# REPLACE PDF
+# REPLACE
 # -------------------------------------------------
 
 @app.post("/replace")
@@ -731,11 +698,25 @@ def replace():
                 )
             )
 
-            if old and new:
+            if not old or not new:
+                continue
 
-                replacement_map[
-                    old
-                ] = new
+            # Exact same digit count.
+            # Isse original character positions
+            # preserve karna possible hota hai.
+            if len(old) != len(new):
+                continue
+
+            replacement_map[
+                old
+            ] = new
+
+        if not replacement_map:
+
+            return jsonify({
+                "error":
+                    "Valid replacement nahi mila. Old aur new number mein same digit count hona chahiye."
+            }), 400
 
         doc = fitz.open(
             stream=pdf_bytes,
@@ -744,16 +725,16 @@ def replace():
 
         changed = 0
 
-        for page_index in range(
-            len(doc)
-        ):
+        # Font files ko baar-baar extract
+        # karne se bachane ke liye cache.
+        font_cache = {}
 
-            page = doc[
-                page_index
-            ]
+        for page in doc:
 
-            candidates = detect_numbers(
-                page
+            candidates = (
+                detect_numbers_from_chars(
+                    page
+                )
             )
 
             pending = []
@@ -771,7 +752,6 @@ def replace():
                     not in
                     replacement_map
                 ):
-
                     continue
 
                 new_digits = (
@@ -780,17 +760,6 @@ def replace():
                     ]
                 )
 
-                # Exact digit count is
-                # required so the original
-                # character positions remain.
-                if (
-                    len(new_digits)
-                    !=
-                    len(old_digits)
-                ):
-
-                    continue
-
                 digit_index = 0
 
                 for char in candidate:
@@ -798,15 +767,12 @@ def replace():
                     if not char[
                         "digit"
                     ]:
-
                         continue
 
                     if (
                         digit_index
-                        >=
-                        len(new_digits)
+                        >= len(new_digits)
                     ):
-
                         break
 
                     new_digit = (
@@ -821,18 +787,18 @@ def replace():
                         get_font_file(
                             doc,
                             page,
-                            char["font"]
+                            char["font"],
+                            font_cache
                         )
                     )
 
                     if font_file:
-
                         temp_files.append(
                             font_file
                         )
 
                     item = (
-                        replace_character_digit(
+                        prepare_replacement(
                             page,
                             char,
                             new_digit,
@@ -907,24 +873,22 @@ def replace():
     except Exception as e:
 
         return jsonify({
-
-            "error":
-                str(e)
-
+            "error": str(e)
         }), 500
 
     finally:
 
-        for path in temp_files:
+        # Duplicate paths remove karo.
+        for path in set(
+            temp_files
+        ):
 
             try:
-
                 os.unlink(
                     path
                 )
 
             except Exception:
-
                 pass
 
 
@@ -936,14 +900,13 @@ def replace():
 def home():
 
     return jsonify({
-
         "status":
             "PDF Number Engine running"
     })
 
 
 # -------------------------------------------------
-# LOCAL START
+# START
 # -------------------------------------------------
 
 if __name__ == "__main__":
