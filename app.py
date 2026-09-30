@@ -3,6 +3,7 @@ import io
 import os
 import re
 import tempfile
+import unicodedata
 
 import fitz
 from flask import Flask, request, jsonify
@@ -73,6 +74,15 @@ def normalize_digit(ch):
 
     if "0" <= ch <= "9":
         return ch
+
+    # Automatically recognize Unicode decimal digits (Nd), including
+    # mathematical bold/double-struck/sans/monospace and fullwidth digits.
+    try:
+        value = unicodedata.digit(ch)
+        if 0 <= value <= 9:
+            return str(value)
+    except (TypeError, ValueError):
+        pass
 
     return None
 
@@ -571,18 +581,119 @@ def detect_country(number):
 # -------------------------------------------------
 
 def is_special_char(ch):
-    """True when the character is not an alphanumeric character."""
-    return bool(ch) and not ch.isalnum()
+    """True when the character is not an ordinary ASCII alphanumeric."""
+    if not ch:
+        return False
+    return not ("A" <= ch <= "Z" or "a" <= ch <= "z" or "0" <= ch <= "9")
+
+
+def is_unicode_styled_char(ch):
+    """
+    Detect Unicode characters commonly produced by fancy-text generators.
+
+    This is intentionally based on Unicode properties/blocks rather than a
+    short hard-coded list, so new variants in the same Unicode families can
+    still be detected.
+    """
+    if not ch:
+        return False
+
+    code = ord(ch)
+    category = unicodedata.category(ch)
+    name = unicodedata.name(ch, "")
+
+    # Combining marks are used heavily by glitch/Zalgo generators.
+    if category.startswith("M"):
+        return True
+
+    # Non-ASCII mathematical alphanumeric symbols.
+    if 0x1D400 <= code <= 0x1D7FF:
+        return True
+
+    # Enclosed alphanumerics / dingbats / superscripts / subscripts.
+    if 0x2460 <= code <= 0x24FF:
+        return True
+    if 0x2776 <= code <= 0x2793:
+        return True
+    if 0x2070 <= code <= 0x209F:
+        return True
+
+    # Fullwidth forms.
+    if 0xFF00 <= code <= 0xFFEF:
+        return True
+
+    # Common Unicode fancy-text alphabets and compatibility forms.
+    if any(key in name for key in (
+        "MATHEMATICAL",
+        "FULLWIDTH",
+        "CIRCLED",
+        "PARENTHESIZED",
+        "SQUARED",
+        "NEGATIVE CIRCLED",
+        "NEGATIVE SQUARED",
+        "SMALL CAPITAL",
+    )):
+        return True
+
+    # Non-ASCII letters/numbers are useful signals for fancy Unicode text.
+    if code > 0x7F and category[0] in ("L", "N"):
+        return True
+
+    return False
+
+
+def is_decorative_char(ch):
+    """Unicode punctuation/symbol/emoji that may be part of fancy text."""
+    if not ch:
+        return False
+
+    category = unicodedata.category(ch)
+    return category[0] in ("P", "S") and ord(ch) > 0x7F
+
+
+def token_is_fancy_or_special(token):
+    """
+    Decide whether a whitespace-delimited PDF token is worth exposing as a
+    replaceable special/fancy-text item.
+
+    Ordinary ASCII words and ordinary ASCII punctuation are ignored unless
+    the token contains multiple decorative characters. Unicode fancy text,
+    emoji, combining marks, fullwidth characters, mathematical alphabets,
+    etc. are exposed.
+    """
+    if not token:
+        return False
+
+    text = "".join(x["char"] for x in token)
+
+    if any(is_unicode_styled_char(x["char"]) for x in token):
+        return True
+
+    decorative_count = sum(
+        1 for x in token if is_decorative_char(x["char"])
+    )
+
+    # Preserve the user's earlier requirement for strings such as !@#$%^&*()
+    # without turning every normal sentence ending into a candidate.
+    ascii_symbol_count = sum(
+        1
+        for x in token
+        if ord(x["char"]) < 128
+        and not x["char"].isalnum()
+        and not x["char"].isspace()
+    )
+
+    return decorative_count >= 1 or ascii_symbol_count >= 3
 
 
 def special_text_candidates(page):
     """
-    Return exact text tokens from PDF lines that contain at least
-    one non-alphanumeric Unicode character.
+    Find exact whitespace-delimited PDF text tokens that contain fancy
+    Unicode, combining marks, emoji/decorative symbols, or several special
+    ASCII characters.
 
-    This is deliberately Unicode-based: no hard-coded symbol list is
-    used, so symbols, emoji, kaomoji, full-width punctuation, etc. can
-    be handled when the PDF exposes them as text characters.
+    This deliberately does not require a fixed list of LingoJam/Picsart/
+    FancyText/Coddy styles. Unicode properties are used instead.
     """
     chars = page_characters(page)
     lines = {}
@@ -595,20 +706,14 @@ def special_text_candidates(page):
 
     for line_chars in lines.values():
         line_chars.sort(key=lambda x: x["bbox"][0])
-
-        # Split on ordinary whitespace, while preserving every character
-        # inside each token. This keeps examples such as (❁´◡`❁) intact.
         current = []
 
         def flush():
             nonlocal current
-            if not current:
-                return
-
-            text = "".join(x["char"] for x in current)
-            if any(is_special_char(x["char"]) for x in current):
-                candidates.append(current[:])
-            current = []
+            if current:
+                if token_is_fancy_or_special(current):
+                    candidates.append(current[:])
+                current = []
 
         for item in line_chars:
             ch = item["char"]
