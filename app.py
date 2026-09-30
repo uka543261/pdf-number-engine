@@ -688,34 +688,22 @@ def analyze():
 
 def get_font_file(
     doc,
-    page,
+    fonts,
     font_name,
     font_cache,
-    page_fonts_cache,
     temp_files
 ):
     """
-    SPEED OPTIMIZATION ONLY.
+    Memory-safe font extraction with one page-font lookup.
 
-    The original replacement behavior is preserved.
-    The same font is extracted only once per request instead
-    of once for every replaced digit.
+    SPEED ONLY: the original font extraction and insertion behavior
+    is unchanged; page.get_fonts(full=True) is supplied once per page.
     """
 
     cache_key = font_name or ""
 
     if cache_key in font_cache:
         return font_cache[cache_key]
-
-    # Read page fonts only once for this page.
-    page_key = id(page)
-
-    if page_key not in page_fonts_cache:
-        page_fonts_cache[page_key] = page.get_fonts(
-            full=True
-        )
-
-    fonts = page_fonts_cache[page_key]
 
     matched_xref = None
 
@@ -751,10 +739,7 @@ def get_font_file(
                 suffix = (
                     ".ttf"
                     if str(info[1]).lower()
-                    in (
-                        "ttf",
-                        "truetype"
-                    )
+                    in ("ttf", "truetype")
                     else ".otf"
                 )
 
@@ -767,7 +752,6 @@ def get_font_file(
                 temp.close()
 
                 path = temp.name
-
                 temp_files.append(path)
 
                 font_cache[cache_key] = path
@@ -778,7 +762,6 @@ def get_font_file(
         pass
 
     font_cache[cache_key] = None
-
     return None
 
 
@@ -916,10 +899,10 @@ def replace():
 
     temp_files = []
 
-    # SPEED ONLY:
-    # Reuse the same extracted font across all matching digits.
+    # One cache for the whole PDF replacement request.
+    # A font is extracted at most once, even when it appears on
+    # many pages and in hundreds of digits.
     font_cache = {}
-    page_fonts_cache = {}
 
     try:
 
@@ -972,6 +955,10 @@ def replace():
             page = doc[
                 page_index
             ]
+
+            # SPEED ONLY: read the page font table once.
+            # The old replacement logic below remains unchanged.
+            page_fonts = page.get_fonts(full=True)
 
             candidates = detect_numbers(
                 page
@@ -1029,10 +1016,9 @@ def replace():
                     font_file = (
                         get_font_file(
                             doc,
-                            page,
+                            page_fonts,
                             char["font"],
                             font_cache,
-                            page_fonts_cache,
                             temp_files
                         )
                     )
