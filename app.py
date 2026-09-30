@@ -691,13 +691,15 @@ def get_font_file(
     page,
     font_name,
     font_cache,
+    page_fonts_cache,
     temp_files
 ):
     """
-    Memory-safe font extraction.
+    SPEED OPTIMIZATION ONLY.
 
-    The same PDF font is commonly used many times and across many
-    pages. Extract it only once for the whole replacement request.
+    The original replacement behavior is preserved.
+    The same font is extracted only once per request instead
+    of once for every replaced digit.
     """
 
     cache_key = font_name or ""
@@ -705,9 +707,19 @@ def get_font_file(
     if cache_key in font_cache:
         return font_cache[cache_key]
 
+    # Read page fonts only once for this page.
+    page_key = id(page)
+
+    if page_key not in page_fonts_cache:
+        page_fonts_cache[page_key] = page.get_fonts(
+            full=True
+        )
+
+    fonts = page_fonts_cache[page_key]
+
     matched_xref = None
 
-    for font in page.get_fonts(full=True):
+    for font in fonts:
 
         xref = font[0]
         basefont = font[3] or ""
@@ -739,7 +751,10 @@ def get_font_file(
                 suffix = (
                     ".ttf"
                     if str(info[1]).lower()
-                    in ("ttf", "truetype")
+                    in (
+                        "ttf",
+                        "truetype"
+                    )
                     else ".otf"
                 )
 
@@ -752,6 +767,7 @@ def get_font_file(
                 temp.close()
 
                 path = temp.name
+
                 temp_files.append(path)
 
                 font_cache[cache_key] = path
@@ -762,6 +778,7 @@ def get_font_file(
         pass
 
     font_cache[cache_key] = None
+
     return None
 
 
@@ -899,10 +916,10 @@ def replace():
 
     temp_files = []
 
-    # One cache for the whole PDF replacement request.
-    # A font is extracted at most once, even when it appears on
-    # many pages and in hundreds of digits.
+    # SPEED ONLY:
+    # Reuse the same extracted font across all matching digits.
     font_cache = {}
+    page_fonts_cache = {}
 
     try:
 
@@ -1015,6 +1032,7 @@ def replace():
                             page,
                             char["font"],
                             font_cache,
+                            page_fonts_cache,
                             temp_files
                         )
                     )
