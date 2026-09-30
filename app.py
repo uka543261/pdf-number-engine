@@ -75,18 +75,14 @@ def normalize_digit(ch):
     if "0" <= ch <= "9":
         return ch
 
-    # Detect Unicode decimal digits automatically.
-    # This includes mathematical/fancy digit styles such as:
-    # 𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗
-    # 𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡
-    # 𝟢𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫
-    # 𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵
-    # 𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿
-    # and other Unicode decimal-digit characters.
+    # Automatically recognize Unicode decimal digits used by
+    # fancy/LingoJam-style number variants.
     try:
         value = unicodedata.decimal(ch)
+
         if 0 <= value <= 9:
             return str(value)
+
     except (TypeError, ValueError):
         pass
 
@@ -549,132 +545,6 @@ def detect_numbers(page):
 
 
 # -------------------------------------------------
-# FANCY / UNICODE TEXT DETECTION
-# -------------------------------------------------
-
-def is_combining_mark(ch):
-    try:
-        return unicodedata.category(ch).startswith("M")
-    except Exception:
-        return False
-
-
-def is_unicode_styled_char(ch):
-    """
-    Detect characters that are commonly used by fancy-text,
-    Unicode-font, glitch/Zalgo and decorative generators.
-
-    This is intentionally separate from phone-number detection.
-    It does NOT change the existing phone replacement flow.
-    """
-    if not ch:
-        return False
-
-    try:
-        category = unicodedata.category(ch)
-        name = unicodedata.name(ch, "")
-    except Exception:
-        return False
-
-    # Combining marks are commonly used by glitch/Zalgo text.
-    if category.startswith("M"):
-        return True
-
-    # Unicode mathematical alphanumeric symbols.
-    if "MATHEMATICAL " in name:
-        return True
-
-    # Enclosed/circled/squared/parenthesized forms.
-    if any(word in name for word in (
-        "CIRCLED",
-        "SQUARED",
-        "PARENTHESIZED",
-        "NEGATIVE CIRCLED",
-    )):
-        return True
-
-    # Fullwidth and halfwidth Unicode forms.
-    if "FULLWIDTH" in name or "HALFWIDTH" in name:
-        return True
-
-    # Superscript/subscript characters.
-    if "SUPERSCRIPT" in name or "SUBSCRIPT" in name:
-        return True
-
-    return False
-
-
-def detect_fancy_text(page):
-    """
-    Find contiguous PDF text runs containing Unicode-styled
-    characters. This is detection-only for now.
-
-    The existing number replacement endpoint is deliberately
-    untouched. The returned data can be connected to the UI
-    in the next step.
-    """
-    chars = page_characters(page)
-
-    results = []
-    current = []
-    current_page_line = None
-
-    for item in chars:
-        char = item["char"]
-
-        styled = is_unicode_styled_char(char)
-
-        # A styled character starts/continues a run.
-        if styled:
-            line_key = (
-                item["block_index"],
-                item["line_index"]
-            )
-
-            if current and line_key != current_page_line:
-                text = candidate_text(current)
-                if text:
-                    results.append(current[:])
-                current = []
-
-            current.append(item)
-            current_page_line = line_key
-            continue
-
-        # Keep ordinary characters that are directly adjacent to a
-        # styled character, so a run such as T̷e̷x̷t̷ is captured
-        # as the complete visible text rather than only the marks.
-        if current:
-            current.append(item)
-            current_page_line = (
-                item["block_index"],
-                item["line_index"]
-            )
-            continue
-
-    if current:
-        results.append(current[:])
-
-    # Remove runs that contain no actual styled character.
-    cleaned = []
-
-    for run in results:
-        if any(
-            is_unicode_styled_char(x["char"])
-            for x in run
-        ):
-            cleaned.append(run)
-
-    return cleaned
-
-
-def fancy_text_value(run):
-    return "".join(
-        x["char"]
-        for x in run
-    )
-
-# -------------------------------------------------
 # COUNTRY
 # -------------------------------------------------
 
@@ -787,14 +657,7 @@ def analyze():
                         raw
                     )
 
-        # Keep the original number-analysis result untouched.
-        # Re-open the PDF only for the new detection-only pass.
         doc.close()
-
-        fancy_doc = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
 
         numbers = list(
             found.values()
@@ -806,40 +669,9 @@ def analyze():
             reverse=True
         )
 
-        fancy_found = {}
-
-        # Detection only. Existing phone-number results remain
-        # exactly as before.
-        for page_index in range(len(fancy_doc)):
-            page = fancy_doc[page_index]
-
-            for run in detect_fancy_text(page):
-                value = fancy_text_value(run)
-
-                if not value:
-                    continue
-
-                if value not in fancy_found:
-                    fancy_found[value] = {
-                        "text": value,
-                        "count": 0
-                    }
-
-                fancy_found[value]["count"] += 1
-
-        fancy_texts = list(fancy_found.values())
-
-        fancy_texts.sort(
-            key=lambda x: x["count"],
-            reverse=True
-        )
-
-        fancy_doc.close()
-
         return jsonify({
             "success": True,
-            "numbers": numbers,
-            "fancyTexts": fancy_texts
+            "numbers": numbers
         })
 
     except Exception as e:
