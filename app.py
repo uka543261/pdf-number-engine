@@ -688,69 +688,117 @@ def analyze():
 def get_font_file(
     doc,
     page,
-    font_name
+    font_name,
+    font_cache,
+    page_font_cache,
+    temp_files,
+    page_index
 ):
+    """
+    FAST FONT EXTRACTION
 
-    fonts = page.get_fonts(
-        full=True
+    The old version extracted the same embedded PDF font again
+    for every single replaced digit. That can make /replace take
+    several minutes.
+
+    This version:
+    - reads page fonts only once per page
+    - extracts each matching font only once
+    - reuses the same temporary font file for all digits
+    """
+
+    cache_key = (
+        page_index,
+        font_name or ""
     )
+
+    if cache_key in font_cache:
+        return font_cache[cache_key]
+
+    if page_index not in page_font_cache:
+        page_font_cache[page_index] = page.get_fonts(
+            full=True
+        )
+
+    fonts = page_font_cache[page_index]
+
+    matched_xref = None
+    matched_type = ""
 
     for font in fonts:
 
         xref = font[0]
-
-        basefont = font[3]
+        basefont = font[3] or ""
 
         if (
             basefont == font_name
             or font_name in basefont
             or basefont in font_name
         ):
+            matched_xref = xref
+            matched_type = str(
+                font[2] or ""
+            ).lower()
+            break
 
-            try:
+    if matched_xref is None:
+        font_cache[cache_key] = None
+        return None
 
-                info = doc.extract_font(
-                    xref
+    try:
+
+        info = doc.extract_font(
+            matched_xref
+        )
+
+        if (
+            info
+            and len(info) >= 4
+        ):
+
+            font_bytes = info[3]
+
+            if font_bytes:
+
+                suffix = (
+                    ".ttf"
+                    if str(
+                        info[1]
+                    ).lower()
+                    in (
+                        "ttf",
+                        "truetype"
+                    )
+                    else ".otf"
                 )
 
-                if (
-                    info
-                    and len(info) >= 4
-                ):
+                temp = (
+                    tempfile.NamedTemporaryFile(
+                        delete=False,
+                        suffix=suffix
+                    )
+                )
 
-                    font_bytes = info[3]
+                temp.write(
+                    font_bytes
+                )
 
-                    if font_bytes:
+                temp.close()
 
-                        suffix = (
-                            ".ttf"
-                            if str(
-                                info[1]
-                            ).lower()
-                            in (
-                                "ttf",
-                                "truetype"
-                            )
-                            else ".otf"
-                        )
+                path = temp.name
 
-                        temp = (
-                            tempfile.NamedTemporaryFile(
-                                delete=False,
-                                suffix=suffix
-                            )
-                        )
+                temp_files.append(
+                    path
+                )
 
-                        temp.write(
-                            font_bytes
-                        )
+                font_cache[cache_key] = path
 
-                        temp.close()
+                return path
 
-                        return temp.name
+    except Exception:
+        pass
 
-            except Exception:
-                pass
+    font_cache[cache_key] = None
 
     return None
 
@@ -889,6 +937,12 @@ def replace():
 
     temp_files = []
 
+    # Performance caches.
+    # The same PDF font is normally used for hundreds of digits.
+    # Extracting it repeatedly was the main /replace slowdown.
+    font_cache = {}
+    page_font_cache = {}
+
     try:
 
         body = request.get_json(
@@ -998,15 +1052,13 @@ def replace():
                         get_font_file(
                             doc,
                             page,
-                            char["font"]
+                            char["font"],
+                            font_cache,
+                            page_font_cache,
+                            temp_files,
+                            page_index
                         )
                     )
-
-                    if font_file:
-
-                        temp_files.append(
-                            font_file
-                        )
 
                     item = (
                         replace_character_digit(
@@ -1049,7 +1101,7 @@ def replace():
 
         doc.save(
             output,
-            garbage=4,
+            garbage=3,
             deflate=True,
             clean=True
         )
