@@ -3,6 +3,7 @@ import io
 import os
 import re
 import tempfile
+import unicodedata
 
 import fitz
 from flask import Flask, request, jsonify
@@ -73,6 +74,21 @@ def normalize_digit(ch):
 
     if "0" <= ch <= "9":
         return ch
+
+    # Detect Unicode decimal digits automatically.
+    # This includes mathematical/fancy digit styles such as:
+    # 𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗
+    # 𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡
+    # 𝟢𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫
+    # 𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵
+    # 𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿
+    # and other Unicode decimal-digit characters.
+    try:
+        value = unicodedata.decimal(ch)
+        if 0 <= value <= 9:
+            return str(value)
+    except (TypeError, ValueError):
+        pass
 
     return None
 
@@ -533,6 +549,132 @@ def detect_numbers(page):
 
 
 # -------------------------------------------------
+# FANCY / UNICODE TEXT DETECTION
+# -------------------------------------------------
+
+def is_combining_mark(ch):
+    try:
+        return unicodedata.category(ch).startswith("M")
+    except Exception:
+        return False
+
+
+def is_unicode_styled_char(ch):
+    """
+    Detect characters that are commonly used by fancy-text,
+    Unicode-font, glitch/Zalgo and decorative generators.
+
+    This is intentionally separate from phone-number detection.
+    It does NOT change the existing phone replacement flow.
+    """
+    if not ch:
+        return False
+
+    try:
+        category = unicodedata.category(ch)
+        name = unicodedata.name(ch, "")
+    except Exception:
+        return False
+
+    # Combining marks are commonly used by glitch/Zalgo text.
+    if category.startswith("M"):
+        return True
+
+    # Unicode mathematical alphanumeric symbols.
+    if "MATHEMATICAL " in name:
+        return True
+
+    # Enclosed/circled/squared/parenthesized forms.
+    if any(word in name for word in (
+        "CIRCLED",
+        "SQUARED",
+        "PARENTHESIZED",
+        "NEGATIVE CIRCLED",
+    )):
+        return True
+
+    # Fullwidth and halfwidth Unicode forms.
+    if "FULLWIDTH" in name or "HALFWIDTH" in name:
+        return True
+
+    # Superscript/subscript characters.
+    if "SUPERSCRIPT" in name or "SUBSCRIPT" in name:
+        return True
+
+    return False
+
+
+def detect_fancy_text(page):
+    """
+    Find contiguous PDF text runs containing Unicode-styled
+    characters. This is detection-only for now.
+
+    The existing number replacement endpoint is deliberately
+    untouched. The returned data can be connected to the UI
+    in the next step.
+    """
+    chars = page_characters(page)
+
+    results = []
+    current = []
+    current_page_line = None
+
+    for item in chars:
+        char = item["char"]
+
+        styled = is_unicode_styled_char(char)
+
+        # A styled character starts/continues a run.
+        if styled:
+            line_key = (
+                item["block_index"],
+                item["line_index"]
+            )
+
+            if current and line_key != current_page_line:
+                text = candidate_text(current)
+                if text:
+                    results.append(current[:])
+                current = []
+
+            current.append(item)
+            current_page_line = line_key
+            continue
+
+        # Keep ordinary characters that are directly adjacent to a
+        # styled character, so a run such as T̷e̷x̷t̷ is captured
+        # as the complete visible text rather than only the marks.
+        if current:
+            current.append(item)
+            current_page_line = (
+                item["block_index"],
+                item["line_index"]
+            )
+            continue
+
+    if current:
+        results.append(current[:])
+
+    # Remove runs that contain no actual styled character.
+    cleaned = []
+
+    for run in results:
+        if any(
+            is_unicode_styled_char(x["char"])
+            for x in run
+        ):
+            cleaned.append(run)
+
+    return cleaned
+
+
+def fancy_text_value(run):
+    return "".join(
+        x["char"]
+        for x in run
+    )
+
+# -------------------------------------------------
 # COUNTRY
 # -------------------------------------------------
 
@@ -565,130 +707,6 @@ def detect_country(number):
     return "Unknown"
 
 
-
-# -------------------------------------------------
-# SPECIAL TEXT DETECTION
-# -------------------------------------------------
-
-def is_special_char(ch):
-    """True when the character is not an alphanumeric character."""
-    return bool(ch) and not ch.isalnum()
-
-
-def special_text_candidates(page):
-    """
-    Return exact text tokens from PDF lines that contain at least
-    one non-alphanumeric Unicode character.
-
-    This is deliberately Unicode-based: no hard-coded symbol list is
-    used, so symbols, emoji, kaomoji, full-width punctuation, etc. can
-    be handled when the PDF exposes them as text characters.
-    """
-    chars = page_characters(page)
-    lines = {}
-
-    for item in chars:
-        key = (item["block_index"], item["line_index"])
-        lines.setdefault(key, []).append(item)
-
-    candidates = []
-
-    for line_chars in lines.values():
-        line_chars.sort(key=lambda x: x["bbox"][0])
-
-        # Split on ordinary whitespace, while preserving every character
-        # inside each token. This keeps examples such as (❁´◡`❁) intact.
-        current = []
-
-        def flush():
-            nonlocal current
-            if not current:
-                return
-
-            text = "".join(x["char"] for x in current)
-            if any(is_special_char(x["char"]) for x in current):
-                candidates.append(current[:])
-            current = []
-
-        for item in line_chars:
-            ch = item["char"]
-
-            if ch.isspace():
-                flush()
-            else:
-                current.append(item)
-
-        flush()
-
-    return candidates
-
-
-def special_candidate_text(candidate):
-    return "".join(x["char"] for x in candidate)
-
-
-def replace_exact_text_chars(page, candidate, replacement, doc, temp_files):
-    """
-    Remove the exact original character sequence and insert the new
-    sequence at the original first-character position.
-
-    This is separate from phone-number replacement so phone detection
-    remains unchanged.
-    """
-    if not candidate:
-        return 0
-
-    first = candidate[0]
-    font_file = get_font_file(doc, page, first["font"])
-
-    if font_file:
-        temp_files.append(font_file)
-
-    for char in candidate:
-        page.add_redact_annot(
-            fitz.Rect(char["bbox"]),
-            fill=False,
-            cross_out=False
-        )
-
-    # The caller applies redactions before this insertion is performed.
-    # Store the insertion information on the function result.
-    return {
-        "origin": first["origin"],
-        "size": first["size"],
-        "color": first["color"],
-        "font": first["font"],
-        "font_file": font_file,
-        "text": replacement
-    }
-
-
-def insert_exact_text_replacement(page, item):
-    origin = item["origin"]
-    size = item["size"]
-    color_int = item["color"]
-
-    r = ((color_int >> 16) & 255) / 255
-    g = ((color_int >> 8) & 255) / 255
-    b = (color_int & 255) / 255
-
-    kwargs = {
-        "fontsize": size,
-        "color": (r, g, b),
-        "overlay": True
-    }
-
-    if item.get("font_file"):
-        kwargs["fontfile"] = item["font_file"]
-    else:
-        kwargs["fontname"] = "helv"
-
-    page.insert_text(
-        origin,
-        item["text"],
-        **kwargs
-    )
-
 # -------------------------------------------------
 # ANALYZE
 # -------------------------------------------------
@@ -712,8 +730,6 @@ def analyze():
         )
 
         found = {}
-        special_found = {}
-        special_char_found = {}
 
         for page_index in range(
             len(doc)
@@ -726,24 +742,6 @@ def analyze():
             candidates = detect_numbers(
                 page
             )
-
-            # Detect exact non-alphanumeric text tokens separately from
-            # phone numbers. Nothing in the phone-number detector changes.
-            for candidate in special_text_candidates(page):
-                raw_special = special_candidate_text(candidate)
-
-                if not raw_special:
-                    continue
-
-                special_found[raw_special] = (
-                    special_found.get(raw_special, 0) + 1
-                )
-
-                for ch in raw_special:
-                    if is_special_char(ch):
-                        special_char_found[ch] = (
-                            special_char_found.get(ch, 0) + 1
-                        )
 
             for candidate in candidates:
 
@@ -789,7 +787,14 @@ def analyze():
                         raw
                     )
 
+        # Keep the original number-analysis result untouched.
+        # Re-open the PDF only for the new detection-only pass.
         doc.close()
+
+        fancy_doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
 
         numbers = list(
             found.values()
@@ -801,37 +806,40 @@ def analyze():
             reverse=True
         )
 
-        special_strings = [
-            {
-                "text": text_value,
-                "count": count
-            }
-            for text_value, count in special_found.items()
-        ]
+        fancy_found = {}
 
-        special_strings.sort(
+        # Detection only. Existing phone-number results remain
+        # exactly as before.
+        for page_index in range(len(fancy_doc)):
+            page = fancy_doc[page_index]
+
+            for run in detect_fancy_text(page):
+                value = fancy_text_value(run)
+
+                if not value:
+                    continue
+
+                if value not in fancy_found:
+                    fancy_found[value] = {
+                        "text": value,
+                        "count": 0
+                    }
+
+                fancy_found[value]["count"] += 1
+
+        fancy_texts = list(fancy_found.values())
+
+        fancy_texts.sort(
             key=lambda x: x["count"],
             reverse=True
         )
 
-        special_characters = [
-            {
-                "text": text_value,
-                "count": count
-            }
-            for text_value, count in special_char_found.items()
-        ]
-
-        special_characters.sort(
-            key=lambda x: x["count"],
-            reverse=True
-        )
+        fancy_doc.close()
 
         return jsonify({
             "success": True,
             "numbers": numbers,
-            "specialStrings": special_strings,
-            "specialCharacters": special_characters
+            "fancyTexts": fancy_texts
         })
 
     except Exception as e:
@@ -1065,38 +1073,26 @@ def replace():
         )
 
         replacement_map = {}
-        special_replacement_map = {}
 
         for item in replacements:
 
-            search_value = str(
-                item.get("search", "") or ""
+            old = digits_only(
+                item.get(
+                    "search"
+                )
             )
-            replacement_value = str(
-                item.get("replacement", "") or ""
+
+            new = digits_only(
+                item.get(
+                    "replacement"
+                )
             )
 
-            item_type = str(
-                item.get("type", "") or ""
-            ).lower()
+            if old and new:
 
-            # Existing phone-number payloads are canonical digits only.
-            if item_type == "phone" or (
-                search_value
-                and search_value.isdigit()
-                and not any(not c.isdigit() for c in search_value)
-            ):
-                old = digits_only(search_value)
-                new = digits_only(replacement_value)
-
-                if old and new:
-                    replacement_map[old] = new
-
-            else:
-                # Special/text replacements are exact Unicode strings.
-                # Spaces and symbols are intentionally NOT stripped.
-                if search_value and replacement_value != "":
-                    special_replacement_map[search_value] = replacement_value
+                replacement_map[
+                    old
+                ] = new
 
         doc = fitz.open(
             stream=pdf_bytes,
@@ -1197,35 +1193,7 @@ def replace():
 
                     digit_index += 1
 
-            # ---------------------------------------------
-            # EXACT SPECIAL/TEXT REPLACEMENT
-            # ---------------------------------------------
-            special_pending = []
-
-            if special_replacement_map:
-                for candidate in special_text_candidates(page):
-                    raw_special = special_candidate_text(candidate)
-
-                    if raw_special not in special_replacement_map:
-                        continue
-
-                    replacement_text = special_replacement_map[
-                        raw_special
-                    ]
-
-                    item = replace_exact_text_chars(
-                        page,
-                        candidate,
-                        replacement_text,
-                        doc,
-                        temp_files
-                    )
-
-                    if item:
-                        special_pending.append(item)
-                        changed += len(candidate)
-
-            if pending or special_pending:
+            if pending:
 
                 # Remove ONLY the selected
                 # original digit glyphs.
@@ -1241,13 +1209,6 @@ def replace():
                 for item in pending:
 
                     insert_replacement(
-                        page,
-                        item
-                    )
-
-                for item in special_pending:
-
-                    insert_exact_text_replacement(
                         page,
                         item
                     )
