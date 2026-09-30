@@ -686,15 +686,18 @@ def analyze():
 # FONT EXTRACTION
 # -------------------------------------------------
 
-def get_font_buffer(
+def get_font_file(
     doc,
-    fonts,
+    page,
     font_name,
-    font_cache
+    font_cache,
+    temp_files
 ):
     """
-    SPEED ONLY:
-    Extract each embedded font once per replacement request.
+    Memory-safe font extraction.
+
+    The same PDF font is commonly used many times and across many
+    pages. Extract it only once for the whole replacement request.
     """
 
     cache_key = font_name or ""
@@ -704,7 +707,7 @@ def get_font_buffer(
 
     matched_xref = None
 
-    for font in fonts:
+    for font in page.get_fonts(full=True):
 
         xref = font[0]
         basefont = font[3] or ""
@@ -732,8 +735,28 @@ def get_font_buffer(
             font_bytes = info[3]
 
             if font_bytes:
-                font_cache[cache_key] = font_bytes
-                return font_bytes
+
+                suffix = (
+                    ".ttf"
+                    if str(info[1]).lower()
+                    in ("ttf", "truetype")
+                    else ".otf"
+                )
+
+                temp = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=suffix
+                )
+
+                temp.write(font_bytes)
+                temp.close()
+
+                path = temp.name
+                temp_files.append(path)
+
+                font_cache[cache_key] = path
+
+                return path
 
     except Exception:
         pass
@@ -802,11 +825,19 @@ def insert_replacement(
     item
 ):
 
-    origin = item["origin"]
+    origin = item[
+        "origin"
+    ]
 
-    size = item["size"]
+    # Keep original extracted
+    # font size.
+    size = item[
+        "size"
+    ]
 
-    color_int = item["color"]
+    color_int = item[
+        "color"
+    ]
 
     r = (
         (color_int >> 16)
@@ -829,25 +860,28 @@ def insert_replacement(
         b
     )
 
+    font_file = item.get(
+        "font_file"
+    )
+
     kwargs = {
         "fontsize": size,
         "color": color,
         "overlay": True
     }
 
-    registered_font = item.get(
-        "registered_font"
-    )
+    # Keep the existing font strategy.
+    if font_file:
 
-    if registered_font:
-
-        kwargs["fontname"] = (
-            registered_font
-        )
+        kwargs[
+            "fontfile"
+        ] = font_file
 
     else:
 
-        kwargs["fontname"] = "helv"
+        kwargs[
+            "fontname"
+        ] = "helv"
 
     page.insert_text(
         origin,
@@ -862,6 +896,13 @@ def insert_replacement(
 
 @app.post("/replace")
 def replace():
+
+    temp_files = []
+
+    # One cache for the whole PDF replacement request.
+    # A font is extracted at most once, even when it appears on
+    # many pages and in hundreds of digits.
+    font_cache = {}
 
     try:
 
@@ -883,11 +924,15 @@ def replace():
         for item in replacements:
 
             old = digits_only(
-                item.get("search")
+                item.get(
+                    "search"
+                )
             )
 
             new = digits_only(
-                item.get("replacement")
+                item.get(
+                    "replacement"
+                )
             )
 
             if old and new:
@@ -903,12 +948,6 @@ def replace():
 
         changed = 0
 
-        # SPEED ONLY:
-        # Embedded font bytes are extracted once for the whole PDF.
-        font_cache = {}
-
-        # SPEED ONLY:
-        # Keep each page's font table only while that page is processed.
         for page_index in range(
             len(doc)
         ):
@@ -916,17 +955,6 @@ def replace():
             page = doc[
                 page_index
             ]
-
-            # full=True is not required for matching the base font name.
-            # The replacement logic only needs the standard font tuple.
-            page_fonts = page.get_fonts(
-                full=False
-            )
-
-            # Register a PDF font once per page/font instead of passing
-            # a font file to every single inserted digit.
-            page_font_aliases = {}
-            page_font_counter = 0
 
             candidates = detect_numbers(
                 page
@@ -981,76 +1009,24 @@ def replace():
                         ]
                     )
 
-                    font_name = (
-                        char["font"]
+                    font_file = (
+                        get_font_file(
+                            doc,
+                            page,
+                            char["font"],
+                            font_cache,
+                            temp_files
+                        )
                     )
-
-                    if (
-                        font_name
-                        in page_font_aliases
-                    ):
-
-                        registered_font = (
-                            page_font_aliases[
-                                font_name
-                            ]
-                        )
-
-                    else:
-
-                        font_buffer = (
-                            get_font_buffer(
-                                doc,
-                                page_fonts,
-                                font_name,
-                                font_cache
-                            )
-                        )
-
-                        registered_font = None
-
-                        if font_buffer:
-
-                            registered_font = (
-                                "R"
-                                + str(
-                                    page_font_counter
-                                )
-                            )
-
-                            page_font_counter += 1
-
-                            try:
-
-                                page.insert_font(
-                                    fontname=(
-                                        registered_font
-                                    ),
-                                    fontbuffer=(
-                                        font_buffer
-                                    )
-                                )
-
-                            except Exception:
-
-                                registered_font = None
-
-                        page_font_aliases[
-                            font_name
-                        ] = registered_font
 
                     item = (
                         replace_character_digit(
                             page,
                             char,
                             new_digit,
-                            None
+                            font_file
                         )
                     )
-
-                    item[
-                        "registered_font"
-                    ] = registered_font
 
                     pending.append(
                         item
@@ -1080,16 +1056,17 @@ def replace():
                         item
                     )
 
-            # Release references without forcing a full GC cycle on
-            # every page. This avoids unnecessary CPU time.
+            # Release large per-page Python objects before moving
+            # to the next page.
             candidates = None
             pending = None
-            page_fonts = None
-            page_font_aliases = None
+            page = None
+            gc.collect()
 
         output = io.BytesIO()
 
-        # Fast save: avoid expensive garbage/cleanup passes.
+        # Avoid expensive PDF garbage/clean passes.
+        # They can multiply RAM usage on larger PDFs.
         doc.save(
             output,
             garbage=0,
@@ -1129,6 +1106,19 @@ def replace():
         return jsonify({
             "error": str(e)
         }), 500
+
+    finally:
+
+        for path in temp_files:
+
+            try:
+
+                os.unlink(
+                    path
+                )
+
+            except Exception:
+                pass
 
 
 # -------------------------------------------------
