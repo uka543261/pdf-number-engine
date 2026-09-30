@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import os
 import re
@@ -690,42 +691,23 @@ def get_font_file(
     page,
     font_name,
     font_cache,
-    page_font_cache,
-    temp_files,
-    page_index
+    temp_files
 ):
     """
-    FAST FONT EXTRACTION
+    Memory-safe font extraction.
 
-    The old version extracted the same embedded PDF font again
-    for every single replaced digit. That can make /replace take
-    several minutes.
-
-    This version:
-    - reads page fonts only once per page
-    - extracts each matching font only once
-    - reuses the same temporary font file for all digits
+    The same PDF font is commonly used many times and across many
+    pages. Extract it only once for the whole replacement request.
     """
 
-    cache_key = (
-        page_index,
-        font_name or ""
-    )
+    cache_key = font_name or ""
 
     if cache_key in font_cache:
         return font_cache[cache_key]
 
-    if page_index not in page_font_cache:
-        page_font_cache[page_index] = page.get_fonts(
-            full=True
-        )
-
-    fonts = page_font_cache[page_index]
-
     matched_xref = None
-    matched_type = ""
 
-    for font in fonts:
+    for font in page.get_fonts(full=True):
 
         xref = font[0]
         basefont = font[3] or ""
@@ -736,9 +718,6 @@ def get_font_file(
             or basefont in font_name
         ):
             matched_xref = xref
-            matched_type = str(
-                font[2] or ""
-            ).lower()
             break
 
     if matched_xref is None:
@@ -751,10 +730,7 @@ def get_font_file(
             matched_xref
         )
 
-        if (
-            info
-            and len(info) >= 4
-        ):
+        if info and len(info) >= 4:
 
             font_bytes = info[3]
 
@@ -762,34 +738,21 @@ def get_font_file(
 
                 suffix = (
                     ".ttf"
-                    if str(
-                        info[1]
-                    ).lower()
-                    in (
-                        "ttf",
-                        "truetype"
-                    )
+                    if str(info[1]).lower()
+                    in ("ttf", "truetype")
                     else ".otf"
                 )
 
-                temp = (
-                    tempfile.NamedTemporaryFile(
-                        delete=False,
-                        suffix=suffix
-                    )
+                temp = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=suffix
                 )
 
-                temp.write(
-                    font_bytes
-                )
-
+                temp.write(font_bytes)
                 temp.close()
 
                 path = temp.name
-
-                temp_files.append(
-                    path
-                )
+                temp_files.append(path)
 
                 font_cache[cache_key] = path
 
@@ -799,7 +762,6 @@ def get_font_file(
         pass
 
     font_cache[cache_key] = None
-
     return None
 
 
@@ -937,11 +899,10 @@ def replace():
 
     temp_files = []
 
-    # Performance caches.
-    # The same PDF font is normally used for hundreds of digits.
-    # Extracting it repeatedly was the main /replace slowdown.
+    # One cache for the whole PDF replacement request.
+    # A font is extracted at most once, even when it appears on
+    # many pages and in hundreds of digits.
     font_cache = {}
-    page_font_cache = {}
 
     try:
 
@@ -1054,9 +1015,7 @@ def replace():
                             page,
                             char["font"],
                             font_cache,
-                            page_font_cache,
-                            temp_files,
-                            page_index
+                            temp_files
                         )
                     )
 
@@ -1097,13 +1056,22 @@ def replace():
                         item
                     )
 
+            # Release large per-page Python objects before moving
+            # to the next page.
+            candidates = None
+            pending = None
+            page = None
+            gc.collect()
+
         output = io.BytesIO()
 
+        # Avoid expensive PDF garbage/clean passes.
+        # They can multiply RAM usage on larger PDFs.
         doc.save(
             output,
-            garbage=3,
+            garbage=0,
             deflate=True,
-            clean=True
+            clean=False
         )
 
         doc.close()
