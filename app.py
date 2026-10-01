@@ -798,32 +798,157 @@ def insert_replacement(page, item):
 
 
 # -------------------------------------------------
+# FAST REPLACEMENT HELPERS
+# -------------------------------------------------
+
+def find_target_numbers(page, target_map):
+    """
+    Fast replacement-only scanner.
+
+    Unlike detect_numbers(), this does not build every possible phone
+    candidate. It only looks for the exact digit strings requested by
+    the user and keeps the original character objects/formatting.
+    """
+    chars = page_characters(page)
+    if not chars:
+        return []
+
+    # Work inside each original text block.  A phone number can wrap to
+    # the next line, so block text is flattened while letters still act
+    # as hard boundaries and non-alphanumeric characters are formatting.
+    blocks = {}
+    for item in chars:
+        blocks.setdefault(item["block_index"], []).append(item)
+
+    found = []
+    targets = sorted(target_map, key=len, reverse=True)
+
+    for block_chars in blocks.values():
+        # Keep PDF reading order: line Y, then line id, then X.
+        lines = {}
+        for item in block_chars:
+            lines.setdefault(item["line_index"], []).append(item)
+
+        ordered = []
+        for line_id, line_chars in lines.items():
+            line_chars.sort(key=lambda x: x["bbox"][0])
+            if line_chars:
+                ordered.append((
+                    min(x["bbox"][1] for x in line_chars),
+                    line_id,
+                    line_chars
+                ))
+        ordered.sort(key=lambda x: (x[0], x[1]))
+
+        # Build only digit runs. Adjacent runs on consecutive lines are
+        # joined when the line break is clearly formatting.
+        fragments = []
+        for pos, (_, line_id, line_chars) in enumerate(ordered):
+            current = []
+            for item in line_chars:
+                if item["digit"]:
+                    current.append(item)
+                    continue
+                if item["char"].isalnum():
+                    if current:
+                        fragments.append((pos, line_id, current))
+                        current = []
+            if current:
+                fragments.append((pos, line_id, current))
+
+        # Merge line fragments only when the break is formatting.
+        merged = []
+        i = 0
+        while i < len(fragments):
+            pos, line_id, current = fragments[i]
+            items = current[:]
+            j = i + 1
+            last_pos = pos
+            while j < len(fragments):
+                npos, nline, nxt = fragments[j]
+                if npos != last_pos + 1:
+                    break
+                prev_line = ordered[last_pos][2]
+                next_line = ordered[npos][2]
+                if not prev_line or not next_line:
+                    break
+                if not (
+                    (not prev_line[-1]["digit"] and not prev_line[-1]["char"].isalnum())
+                    or (not next_line[0]["digit"] and not next_line[0]["char"].isalnum())
+                ):
+                    break
+                if len(items) + len(nxt) > 15:
+                    break
+                items.extend(nxt)
+                last_pos = npos
+                j += 1
+            merged.append(items)
+            i = max(i + 1, j)
+
+        # Exact target matching.  Each merged candidate is checked only
+        # against the requested numbers, not every possible phone length.
+        for items in merged:
+            digits = "".join(x["digit"] for x in items)
+            if digits in target_map:
+                found.append((items, target_map[digits]))
+
+    return found
+
+
+def prepare_digit_replacement(page, char, new_digit, font_file):
+    x0, y0, x1, y1 = char["bbox"]
+    page.add_redact_annot(
+        fitz.Rect(x0, y0, x1, y1),
+        fill=False,
+        cross_out=False
+    )
+    return {
+        "origin": tuple(char["origin"]),
+        "size": char["size"],
+        "color": char["color"],
+        "font_file": font_file,
+        "digit": new_digit
+    }
+
+
+def insert_fast(page, item, font_alias):
+    color_int = item["color"]
+    color = (
+        ((color_int >> 16) & 255) / 255,
+        ((color_int >> 8) & 255) / 255,
+        (color_int & 255) / 255
+    )
+    kwargs = {
+        "fontsize": item["size"],
+        "color": color,
+        "overlay": True
+    }
+    if font_alias:
+        kwargs["fontname"] = font_alias
+    else:
+        kwargs["fontname"] = "helv"
+    page.insert_text(item["origin"], item["digit"], **kwargs)
+
+
+# -------------------------------------------------
 # REPLACE
 # -------------------------------------------------
 
 @app.post("/replace")
 def replace():
-
-    # Each embedded font is extracted only once for the whole request.
     font_cache = {}
     temp_files = []
-
-    # Registered aliases are page-specific because fonts must be
-    # registered on the page where they are used.
     page_font_aliases = {}
 
     try:
         body = request.get_json(force=True)
-
         pdf_bytes = clean_base64(body.get("data"))
         replacements = body.get("replacements", [])
 
         replacement_map = {}
-
         for item in replacements:
             old = digits_only(item.get("search"))
             new = digits_only(item.get("replacement"))
-
             if old and new and len(old) == len(new):
                 replacement_map[old] = new
 
@@ -834,136 +959,86 @@ def replace():
         changed = 0
 
         for page_index in range(len(doc)):
-
             page = doc[page_index]
 
-            # Fast page skip. This uses the normal text layer first;
-            # only pages that contain a target digit sequence are
-            # passed through the more expensive raw-character detector.
-            page_text = page.get_text("text")
-            page_digits = digits_only(page_text)
-
-            if not any(old in page_digits for old in replacement_map):
+            # Very cheap text pre-check before rawdict extraction.
+            text = page.get_text("text")
+            text_digits = digits_only(text)
+            if not text_digits or not any(x in text_digits for x in replacement_map):
                 continue
 
-            candidates = detect_numbers(page)
+            occurrences = find_target_numbers(page, replacement_map)
+            if not occurrences:
+                continue
+
             pending = []
             aliases = page_font_aliases.setdefault(page_index, {})
 
-            for candidate in candidates:
-
-                old_digits = candidate_digits(candidate)
-                new_digits = replacement_map.get(old_digits)
-
-                if not new_digits:
-                    continue
-
+            for chars, new_digits in occurrences:
                 digit_index = 0
-
-                for char in candidate:
-
+                for char in chars:
                     if not char["digit"]:
                         continue
 
-                    if digit_index >= len(new_digits):
-                        break
-
-                    original_font = char["font"] or ""
                     font_file = get_font_file(
-                        doc,
-                        page,
-                        original_font,
-                        font_cache
+                        doc, page, char["font"] or "", font_cache
                     )
-
-                    item = replace_character_digit(
-                        page,
-                        char,
-                        new_digits[digit_index],
-                        font_file
+                    pending.append(
+                        prepare_digit_replacement(
+                            page,
+                            char,
+                            new_digits[digit_index],
+                            font_file
+                        )
                     )
-
-                    pending.append(item)
                     changed += 1
                     digit_index += 1
 
-            if pending:
-                page.apply_redactions(
-                    images=0,
-                    graphics=0,
-                    text=0
-                )
+            page.apply_redactions(images=0, graphics=0, text=0)
 
-                # Register each embedded font once AFTER redaction.
-                # apply_redactions() can rebuild page resources, so registering
-                # the font before it would be discarded.
-                aliases = {}
+            # Register each extracted font only once per page. Using the
+            # registered alias avoids passing a font file on every glyph.
+            for item in pending:
+                font_file = item["font_file"]
+                alias = None
+                if font_file:
+                    alias = aliases.get(font_file)
+                    if alias is None and font_file not in aliases:
+                        alias = "N" + str(len(aliases))
+                        try:
+                            page.insert_font(
+                                fontname=alias,
+                                fontfile=font_file
+                            )
+                            aliases[font_file] = alias
+                        except Exception:
+                            aliases[font_file] = None
+                            alias = None
 
-                for item in pending:
-                    font_file = item.get("font_file")
-
-                    if font_file:
-                        alias = aliases.get(font_file)
-
-                        if alias is None:
-                            alias = "N" + str(len(aliases))
-
-                            try:
-                                page.insert_font(
-                                    fontname=alias,
-                                    fontfile=font_file
-                                )
-                                aliases[font_file] = alias
-                            except Exception:
-                                aliases[font_file] = None
-                                alias = None
-
-                        item["font_name"] = alias
-
-                    insert_replacement(page, item)
-
-            del candidates
-            del pending
-            del page
+                insert_fast(page, item, alias)
 
         output = io.BytesIO()
-
-        doc.save(
-            output,
-            garbage=0,
-            deflate=True,
-            clean=False
-        )
-
+        doc.save(output, garbage=0, deflate=True, clean=False)
         doc.close()
         output.seek(0)
 
         encoded = base64.b64encode(output.read()).decode("ascii")
-
-        result = jsonify({
+        return jsonify({
             "success": True,
             "changedCharacters": changed,
             "fileName": make_output_name(body.get("fileName")),
             "data": "data:application/pdf;base64," + encoded
         })
 
-        for path in temp_files:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
-
-        return result
-
     except Exception as e:
-        for path in temp_files:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
         return jsonify({"error": str(e)}), 500
 
-
+    finally:
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
 # -------------------------------------------------
 # HEALTH
 # -------------------------------------------------
