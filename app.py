@@ -690,15 +690,9 @@ def get_font_file(
     doc,
     page,
     font_name,
-    font_cache,
-    temp_files
+    font_cache
 ):
-    """
-    Memory-safe font extraction.
-
-    The same PDF font is commonly used many times and across many
-    pages. Extract it only once for the whole replacement request.
-    """
+    """Return an extracted font file path once per PDF font name."""
 
     cache_key = font_name or ""
 
@@ -725,37 +719,18 @@ def get_font_file(
         return None
 
     try:
-
-        info = doc.extract_font(
-            matched_xref
-        )
+        info = doc.extract_font(matched_xref)
 
         if info and len(info) >= 4:
-
             font_bytes = info[3]
 
             if font_bytes:
-
-                suffix = (
-                    ".ttf"
-                    if str(info[1]).lower()
-                    in ("ttf", "truetype")
-                    else ".otf"
-                )
-
-                temp = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=suffix
-                )
-
+                suffix = ".ttf" if str(info[1]).lower() in ("ttf", "truetype") else ".otf"
+                temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
                 temp.write(font_bytes)
                 temp.close()
-
                 path = temp.name
-                temp_files.append(path)
-
                 font_cache[cache_key] = path
-
                 return path
 
     except Exception:
@@ -765,34 +740,18 @@ def get_font_file(
     return None
 
 
-# -------------------------------------------------
-# EXACT DIGIT REPLACEMENT
-# -------------------------------------------------
-
 def replace_character_digit(
     page,
     char,
     new_digit,
-    font_file=None
+    font_name=None
 ):
 
-    x0, y0, x1, y1 = (
-        char["bbox"]
-    )
+    x0, y0, x1, y1 = char["bbox"]
+    origin_x, origin_y = char["origin"]
 
-    origin_x, origin_y = (
-        char["origin"]
-    )
+    rect = fitz.Rect(x0, y0, x1, y1)
 
-    rect = fitz.Rect(
-        x0,
-        y0,
-        x1,
-        y1
-    )
-
-    # Remove ONLY this original
-    # digit glyph.
     page.add_redact_annot(
         rect,
         fill=False,
@@ -800,91 +759,39 @@ def replace_character_digit(
     )
 
     return {
-        "origin": (
-            origin_x,
-            origin_y
-        ),
-
-        # Keep original font size.
+        "origin": (origin_x, origin_y),
         "size": char["size"],
-
         "color": char["color"],
-
-        "font": char["font"],
-
-        "font_file": font_file,
-
-        "rect": rect,
-
+        "font_file": font_name,
         "digit": new_digit
     }
 
 
-def insert_replacement(
-    page,
-    item
-):
+def insert_replacement(page, item):
 
-    origin = item[
-        "origin"
-    ]
-
-    # Keep original extracted
-    # font size.
-    size = item[
-        "size"
-    ]
-
-    color_int = item[
-        "color"
-    ]
-
-    r = (
-        (color_int >> 16)
-        & 255
-    ) / 255
-
-    g = (
-        (color_int >> 8)
-        & 255
-    ) / 255
-
-    b = (
-        color_int
-        & 255
-    ) / 255
+    color_int = item["color"]
 
     color = (
-        r,
-        g,
-        b
-    )
-
-    font_file = item.get(
-        "font_file"
+        ((color_int >> 16) & 255) / 255,
+        ((color_int >> 8) & 255) / 255,
+        (color_int & 255) / 255
     )
 
     kwargs = {
-        "fontsize": size,
+        "fontsize": item["size"],
         "color": color,
         "overlay": True
     }
 
-    # Keep the existing font strategy.
-    if font_file:
-
-        kwargs[
-            "fontfile"
-        ] = font_file
-
+    if item.get("font_name"):
+        kwargs["fontname"] = item["font_name"]
+    elif item.get("font_file"):
+        kwargs["fontfile"] = item["font_file"]
     else:
-
-        kwargs[
-            "fontname"
-        ] = "helv"
+        kwargs["fontname"] = "helv"
 
     page.insert_text(
-        origin,
+        item["origin"],
         item["digit"],
         **kwargs
     )
@@ -897,97 +804,58 @@ def insert_replacement(
 @app.post("/replace")
 def replace():
 
+    # Each embedded font is extracted only once for the whole request.
+    font_cache = {}
     temp_files = []
 
-    # One cache for the whole PDF replacement request.
-    # A font is extracted at most once, even when it appears on
-    # many pages and in hundreds of digits.
-    font_cache = {}
+    # Registered aliases are page-specific because fonts must be
+    # registered on the page where they are used.
+    page_font_aliases = {}
 
     try:
+        body = request.get_json(force=True)
 
-        body = request.get_json(
-            force=True
-        )
-
-        pdf_bytes = clean_base64(
-            body.get("data")
-        )
-
-        replacements = body.get(
-            "replacements",
-            []
-        )
+        pdf_bytes = clean_base64(body.get("data"))
+        replacements = body.get("replacements", [])
 
         replacement_map = {}
 
         for item in replacements:
+            old = digits_only(item.get("search"))
+            new = digits_only(item.get("replacement"))
 
-            old = digits_only(
-                item.get(
-                    "search"
-                )
-            )
+            if old and new and len(old) == len(new):
+                replacement_map[old] = new
 
-            new = digits_only(
-                item.get(
-                    "replacement"
-                )
-            )
+        if not replacement_map:
+            return jsonify({"error": "No valid replacements."}), 400
 
-            if old and new:
-
-                replacement_map[
-                    old
-                ] = new
-
-        doc = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         changed = 0
 
-        for page_index in range(
-            len(doc)
-        ):
+        for page_index in range(len(doc)):
 
-            page = doc[
-                page_index
-            ]
+            page = doc[page_index]
 
-            candidates = detect_numbers(
-                page
-            )
+            # Fast page skip. This uses the normal text layer first;
+            # only pages that contain a target digit sequence are
+            # passed through the more expensive raw-character detector.
+            page_text = page.get_text("text")
+            page_digits = digits_only(page_text)
 
+            if not any(old in page_digits for old in replacement_map):
+                continue
+
+            candidates = detect_numbers(page)
             pending = []
+            aliases = page_font_aliases.setdefault(page_index, {})
 
             for candidate in candidates:
 
-                old_digits = (
-                    candidate_digits(
-                        candidate
-                    )
-                )
+                old_digits = candidate_digits(candidate)
+                new_digits = replacement_map.get(old_digits)
 
-                if (
-                    old_digits
-                    not in replacement_map
-                ):
-                    continue
-
-                new_digits = (
-                    replacement_map[
-                        old_digits
-                    ]
-                )
-
-                # Keep the original number's
-                # digit count.
-                if (
-                    len(new_digits)
-                    != len(old_digits)
-                ):
+                if not new_digits:
                     continue
 
                 digit_index = 0
@@ -997,76 +865,69 @@ def replace():
                     if not char["digit"]:
                         continue
 
-                    if (
-                        digit_index
-                        >= len(new_digits)
-                    ):
+                    if digit_index >= len(new_digits):
                         break
 
-                    new_digit = (
-                        new_digits[
-                            digit_index
-                        ]
+                    original_font = char["font"] or ""
+                    font_file = get_font_file(
+                        doc,
+                        page,
+                        original_font,
+                        font_cache
                     )
 
-                    font_file = (
-                        get_font_file(
-                            doc,
-                            page,
-                            char["font"],
-                            font_cache,
-                            temp_files
-                        )
+                    item = replace_character_digit(
+                        page,
+                        char,
+                        new_digits[digit_index],
+                        font_file
                     )
 
-                    item = (
-                        replace_character_digit(
-                            page,
-                            char,
-                            new_digit,
-                            font_file
-                        )
-                    )
-
-                    pending.append(
-                        item
-                    )
-
+                    pending.append(item)
                     changed += 1
-
                     digit_index += 1
 
             if pending:
-
-                # Remove ONLY the selected
-                # original digit glyphs.
                 page.apply_redactions(
                     images=0,
                     graphics=0,
                     text=0
                 )
 
-                # Put replacement digits back
-                # at their original coordinates
-                # and original font size.
+                # Register each embedded font once AFTER redaction.
+                # apply_redactions() can rebuild page resources, so registering
+                # the font before it would be discarded.
+                aliases = {}
+
                 for item in pending:
+                    font_file = item.get("font_file")
 
-                    insert_replacement(
-                        page,
-                        item
-                    )
+                    if font_file:
+                        alias = aliases.get(font_file)
 
-            # Release large per-page Python objects before moving
-            # to the next page.
-            candidates = None
-            pending = None
-            page = None
-            gc.collect()
+                        if alias is None:
+                            alias = "N" + str(len(aliases))
+
+                            try:
+                                page.insert_font(
+                                    fontname=alias,
+                                    fontfile=font_file
+                                )
+                                aliases[font_file] = alias
+                            except Exception:
+                                aliases[font_file] = None
+                                alias = None
+
+                        item["font_name"] = alias
+
+                    insert_replacement(page, item)
+
+            del candidates
+            del pending
+            del page
 
         output = io.BytesIO()
 
-        # Avoid expensive PDF garbage/clean passes.
-        # They can multiply RAM usage on larger PDFs.
         doc.save(
             output,
             garbage=0,
@@ -1075,50 +936,32 @@ def replace():
         )
 
         doc.close()
-
         output.seek(0)
 
-        encoded = base64.b64encode(
-            output.read()
-        ).decode("ascii")
+        encoded = base64.b64encode(output.read()).decode("ascii")
 
-        return jsonify({
-
+        result = jsonify({
             "success": True,
-
-            "changedCharacters":
-                changed,
-
-            "fileName":
-                make_output_name(
-                    body.get(
-                        "fileName"
-                    )
-                ),
-
-            "data":
-                "data:application/pdf;base64,"
-                + encoded
+            "changedCharacters": changed,
+            "fileName": make_output_name(body.get("fileName")),
+            "data": "data:application/pdf;base64," + encoded
         })
 
-    except Exception as e:
-
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-    finally:
-
         for path in temp_files:
-
             try:
-
-                os.unlink(
-                    path
-                )
-
+                os.unlink(path)
             except Exception:
                 pass
+
+        return result
+
+    except Exception as e:
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        return jsonify({"error": str(e)}), 500
 
 
 # -------------------------------------------------
